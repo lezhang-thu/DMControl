@@ -1,18 +1,40 @@
 """Environment migration checks without requiring an OpenGL renderer."""
 
+import os
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 import numpy as np
-from dm_control import suite
 from gymnasium.utils.env_checker import check_env
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from env import make
+from env import configure_headless_rendering, make
+from dm_control import suite
 
 
 class EnvironmentTests(unittest.TestCase):
+    def test_headless_rendering_selects_egl_without_overriding_a_choice(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MUJOCO_GL", None)
+            os.environ.pop("DISPLAY", None)
+            os.environ.pop("WAYLAND_DISPLAY", None)
+            configure_headless_rendering()
+            self.assertEqual(os.environ["MUJOCO_GL"], "egl")
+
+        with mock.patch.dict(os.environ, {"MUJOCO_GL": "osmesa"}, clear=False):
+            os.environ.pop("DISPLAY", None)
+            os.environ.pop("WAYLAND_DISPLAY", None)
+            configure_headless_rendering()
+            self.assertEqual(os.environ["MUJOCO_GL"], "osmesa")
+
+        with mock.patch.dict(os.environ, {"DISPLAY": ":0"}, clear=False):
+            os.environ.pop("MUJOCO_GL", None)
+            os.environ.pop("WAYLAND_DISPLAY", None)
+            configure_headless_rendering()
+            self.assertNotIn("MUJOCO_GL", os.environ)
+
     def test_action_repeat_matches_native_control_suite(self):
         tasks = [('ball_in_cup', 'catch'), ('cartpole', 'swingup'),
                  ('cheetah', 'run'), ('finger', 'spin'),

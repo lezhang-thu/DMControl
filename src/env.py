@@ -1,8 +1,29 @@
 """Gymnasium interface for the DeepMind Control Suite."""
 
+import os
+
 import gymnasium as gym
 import numpy as np
-from dm_control import suite
+
+
+def configure_headless_rendering():
+    """Use EGL when no window system is available.
+
+    dm_control prefers GLFW. With libglfw installed and no DISPLAY, the Python
+    glfw package warns and glfw.init() returns failure instead of raising, so
+    dm_control never falls through to EGL. MuJoCo then fails in mjr_makeContext.
+    An explicit MUJOCO_GL value is left unchanged.
+    """
+    if os.environ.get("MUJOCO_GL"):
+        return
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return
+    os.environ["MUJOCO_GL"] = "egl"
+
+
+configure_headless_rendering()
+
+from dm_control import suite  # noqa: E402
 
 
 class ControlSuiteEnv(gym.Env):

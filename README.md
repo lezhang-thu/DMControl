@@ -46,24 +46,29 @@ for the current codebase. Environment creation and activation follow the
 
 ## 2. Configure rendering and verify installation
 
-SPR learns from rendered pixel observations, so an OpenGL backend is required.
-On a headless machine with an EGL-capable graphics driver, set this **before**
-starting Python:
+SPR learns from rendered pixel observations. `dm_control` chooses an OpenGL
+backend in this order: GLFW, then EGL, then OSMesa. The
+[Control Suite rendering instructions](https://github.com/google-deepmind/dm_control#rendering)
+list the system libraries for each backend.
+
+`libglfw3` and `libglew2.2` are the windowed GLFW backend. GLFW needs a
+display. On a headless machine `DISPLAY` is unset, and the Python `glfw`
+package only warns about that: `glfw.init()` returns failure instead of
+raising. `dm_control` still selects GLFW, and MuJoCo then fails with
+`an OpenGL platform library has not been loaded into this process`.
+
+Headless GPU rendering uses EGL. `src/env.py` sets `MUJOCO_GL=egl` when that
+variable is unset and neither `DISPLAY` nor `WAYLAND_DISPLAY` is set. Set
+`MUJOCO_GL` yourself to choose another backend. `MUJOCO_EGL_DEVICE_ID` selects
+the EGL GPU.
+
+CPU-only software rendering needs OSMesa, which is a separate library from
+GLFW and GLEW:
 
 ```bash
-export MUJOCO_GL=egl
-```
-
-For software rendering on a CPU-only machine, install the GLX/OSMesa system
-libraries for your Linux distribution and use:
-
-```bash
+sudo apt-get install libosmesa6
 export MUJOCO_GL=osmesa
 ```
-
-The [Control Suite rendering instructions](https://github.com/google-deepmind/dm_control#rendering)
-describe the system libraries and supported backends. Rendering pixel
-observations is required even though the project does not record videos.
 
 Check the installed versions and CUDA availability:
 
@@ -178,7 +183,8 @@ python src/train.py --config-path configs --config-name cartpole_swingup \
 ## 5. Run all six environments with multiple seeds
 
 Paste this Bash block from the repository root after activating the conda
-environment and setting `MUJOCO_GL`. It runs **18 experiments sequentially**:
+environment. Headless runs use EGL unless `MUJOCO_GL` is already set. It runs
+**18 experiments sequentially**:
 six environments, each with seeds 1, 2, and 3. Edit the seed list and horizon
 as needed. Each invocation gets a separate output directory.
 
