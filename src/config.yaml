@@ -58,8 +58,6 @@ seed: 1234
 gpuid: 0
 seed_and_gpuid: [1234, 0] # this item will be ignored when given seed and gpuid
 work_dir: ./spr_runs
-save_buffer: false
-save_model: true
 detach_encoder: false
 # log
 log_interval: 1000

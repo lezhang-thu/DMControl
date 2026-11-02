@@ -3,7 +3,6 @@
 # Licensed under The MIT License
 # --------------------------------------------------------
 
-import os
 import time
 
 from env import make as make_env
@@ -145,8 +144,6 @@ def main(args: DictConfig) -> None:
     exp_name = exp_name + '-k' + str(args.jumps)
     args.work_dir = args.work_dir + '/' + f'{args.agent}_dmc' + '/' + exp_name
     utils.make_dir(args.work_dir)
-    model_dir = utils.make_dir(os.path.join(args.work_dir, 'model'))
-    buffer_dir = utils.make_dir(os.path.join(args.work_dir, 'buffer'))
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -189,12 +186,6 @@ def main(args: DictConfig) -> None:
         if step % args.eval_freq == 0:
             L.log('eval/episode', episode, step)
             evaluate(eval_env, agent, args.num_eval_episodes, L, step, args)
-            if args.save_model:
-                agent.save(model_dir, step)
-                if args.encoder_type == 'pixel':
-                    agent.save_spr(model_dir, step)
-            if args.save_buffer:
-                replay_buffer.save(buffer_dir)
 
         if done:
             if step > 0:

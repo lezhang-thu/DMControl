@@ -612,20 +612,3 @@ class SPRSacAgent(object):
                 utils.soft_update_params(self.SPR.global_classifier,
                                          self.SPR.global_target_classifier,
                                          self.SPR.momentum_tau)
-
-    def save(self, model_dir, step):
-        torch.save(self.actor.state_dict(),
-                   '%s/actor_%s.pt' % (model_dir, step))
-        torch.save(self.critic.state_dict(),
-                   '%s/critic_%s.pt' % (model_dir, step))
-
-    def save_spr(self, model_dir, step):
-        torch.save(self.SPR.state_dict(), '%s/spr_%s.pt' % (model_dir, step))
-
-    def load(self, model_dir, step):
-        self.actor.load_state_dict(
-            torch.load('%s/actor_%s.pt' % (model_dir, step),
-                       map_location=self.device, weights_only=True))
-        self.critic.load_state_dict(
-            torch.load('%s/critic_%s.pt' % (model_dir, step),
-                       map_location=self.device, weights_only=True))

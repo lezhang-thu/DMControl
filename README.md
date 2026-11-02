@@ -132,10 +132,10 @@ evaluation interaction is additional. The code converts `init_steps`,
 `log_interval`, `actor_update_freq`, and `critic_target_update_freq` from agent
 decisions to this step scale internally.
 
-The training loop excludes its upper bound and saves checkpoints during
-evaluation. These horizons include evaluation at the desired budget:
+The training loop excludes its upper bound. These horizons include evaluation
+at the desired budget:
 
-| Desired evaluation checkpoint | `num_env_steps` |
+| Desired evaluation step | `num_env_steps` |
 | --- | ---: |
 | 100,000 steps | `105000` (preset default) |
 | 500,000 steps | `505000` |
@@ -149,7 +149,7 @@ reduce memory use, but change the experimental settings.
 ## 4. Run one environment
 
 Every task preset has `work_dir: ???`, which must be supplied. Hydra changes
-into its run directory, so `work_dir=.` keeps logs and checkpoints beneath the
+into its run directory, so `work_dir=.` keeps logs beneath the
 chosen `hydra.run.dir`. The `configs` path is resolved relative to
 `src/train.py`, as described in the
 [Hydra command-line documentation](https://hydra.cc/docs/advanced/hydra-command-line-flags/).
@@ -208,7 +208,7 @@ as needed. Each invocation gets a separate output directory.
 For a single-seed sweep, change `for seed in 1 2 3` to `for seed in 1`.
 For ten seeds, use `for seed in {1..10}`.
 
-## 6. Find logs and checkpoints
+## 6. Find logs
 
 With the commands above, a task/seed run has this layout:
 
@@ -221,20 +221,11 @@ With the commands above, a task/seed run has this layout:
 ├── train.log
 └── spr_sac_dmc/<generated-experiment-name>/
     ├── train_info.log
-    ├── eval_info.log
-    ├── model/
-    │   ├── actor_<step>.pt
-    │   ├── critic_<step>.pt
-    │   └── spr_<step>.pt
-    └── buffer/
+    └── eval_info.log
 ```
 
 `train_info.log` and `eval_info.log` contain one JSON object per line. Evaluation
 records include `step`, `episode_reward`, `mean_episode_reward`, and
 `best_episode_reward`. Use `mean_episode_reward` at the same `step` to compare
-seeds and environments.
-
-`save_model=true` is the preset default. `save_buffer=false` leaves the buffer
-directory empty. Checkpoints are written at evaluation steps; there is no
-automatic extra checkpoint at the end of the training loop or command-line
-training-resume option.
+seeds and environments. Training writes these scalar logs only. It does not
+save model checkpoints or replay-buffer data.

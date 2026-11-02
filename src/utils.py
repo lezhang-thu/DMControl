@@ -153,7 +153,6 @@ class ReplayBuffer(Dataset):
         self.real_dones = np.empty((capacity, 1), dtype=np.float32) # for auxiliary task
 
         self.idx = 0
-        self.last_save = 0
         self.full = False
 
         self.current_auxiliary_batch_size = batch_size
@@ -289,38 +288,6 @@ class ReplayBuffer(Dataset):
     def add_agent(self, agent):
         if hasattr(agent, 'SPR'):
             self.SPR = agent.SPR
-
-    def save(self, save_dir):
-        if self.idx == self.last_save:
-            return
-        path = os.path.join(save_dir, '%d_%d.pt' % (self.last_save, self.idx))
-        payload = [
-            self.obses[self.last_save:self.idx],
-            self.next_obses[self.last_save:self.idx],
-            self.actions[self.last_save:self.idx],
-            self.rewards[self.last_save:self.idx],
-            self.not_dones[self.last_save:self.idx],
-            self.real_dones[self.last_save:self.idx]
-        ]
-        self.last_save = self.idx
-        # Tensor-only checkpoints work with modern torch.load(weights_only=True).
-        torch.save([torch.from_numpy(array.copy()) for array in payload], path)
-
-    def load(self, save_dir):
-        chunks = os.listdir(save_dir)
-        chucks = sorted(chunks, key=lambda x: int(x.split('_')[0]))
-        for chunk in chucks:
-            start, end = [int(x) for x in chunk.split('.')[0].split('_')]
-            path = os.path.join(save_dir, chunk)
-            payload = torch.load(path, map_location="cpu", weights_only=True)
-            assert self.idx == start
-            self.obses[start:end] = payload[0].numpy()
-            self.next_obses[start:end] = payload[1].numpy()
-            self.actions[start:end] = payload[2].numpy()
-            self.rewards[start:end] = payload[3].numpy()
-            self.not_dones[start:end] = payload[4].numpy()
-            self.real_dones[start:end] = payload[5].numpy()
-            self.idx = end
 
     def __getitem__(self, idx):
         idx = np.random.randint(0,

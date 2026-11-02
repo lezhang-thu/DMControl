@@ -127,7 +127,7 @@ class CropTests(unittest.TestCase):
 
 
 class ReplayTests(NumericalTestCase):
-    def test_tensor_checkpoint_roundtrip_preserves_episode_boundaries(self):
+    def test_episode_boundaries_bootstrap_across_time_limits(self):
         buffer = make_buffer(obs_shape=(3, 4, 4))
         # A time limit still bootstraps, whereas a true termination does not.
         endings = [(False, False), (False, True), (True, False)]
@@ -135,19 +135,13 @@ class ReplayTests(NumericalTestCase):
             observation = np.full((3, 4, 4), i, dtype=np.uint8)
             buffer.add(observation, np.array([i, -i], dtype=np.float32), i + 0.5,
                        observation + 1, terminated, truncated)
+        self.assertEqual(buffer.idx, 3)
         np.testing.assert_array_equal(buffer.not_dones[:3, 0], [1, 1, 0])
         np.testing.assert_array_equal(buffer.real_dones[:3, 0], [0, 1, 1])
-        with tempfile.TemporaryDirectory() as directory:
-            buffer.save(directory)
-            checkpoint = next(Path(directory).glob("*.pt"))
-            payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
-            self.assertEqual(len(payload), 6)
-            self.assertTrue(all(isinstance(item, torch.Tensor) for item in payload))
-            restored = make_buffer(obs_shape=(3, 4, 4))
-            restored.load(directory)
-        self.assertEqual(restored.idx, 3)
-        for name in ("obses", "next_obses", "actions", "rewards", "not_dones", "real_dones"):
-            np.testing.assert_array_equal(getattr(restored, name)[:3], getattr(buffer, name)[:3])
+        np.testing.assert_array_equal(buffer.obses[0], np.full((3, 4, 4), 0, dtype=np.uint8))
+        np.testing.assert_array_equal(buffer.next_obses[2], np.full((3, 4, 4), 3, dtype=np.uint8))
+        np.testing.assert_array_equal(buffer.actions[:3], [[0, 0], [1, -1], [2, -2]])
+        np.testing.assert_array_equal(buffer.rewards[:3, 0], [0.5, 1.5, 2.5])
 
 
 class AugmentationTests(NumericalTestCase):
@@ -221,24 +215,6 @@ class AgentTests(NumericalTestCase):
         action = agent.sample_action(observation)
         self.assertEqual(action.shape, (2,))
         self.assertTrue(np.all(np.abs(action) <= 1.0))
-
-    def test_model_checkpoints_roundtrip_with_weights_only_loading(self):
-        agent = make_agent()
-        observation = np.full((9, 84, 84), 128, dtype=np.uint8)
-        expected_action = agent.select_action(observation)
-        with tempfile.TemporaryDirectory() as directory:
-            agent.save(directory, 7)
-            agent.save_spr(directory, 7)
-            restored = make_agent()
-            restored.load(directory, 7)
-            restored.SPR.load_state_dict(torch.load(
-                Path(directory) / "spr_7.pt", map_location="cpu", weights_only=True,
-            ))
-        np.testing.assert_array_equal(restored.select_action(observation), expected_action)
-        for original, loaded in ((agent.actor, restored.actor), (agent.critic, restored.critic),
-                                 (agent.SPR, restored.SPR)):
-            for key, value in original.state_dict().items():
-                torch.testing.assert_close(value, loaded.state_dict()[key], rtol=0, atol=0)
 
 
 class PixelEnv(gym.Env):

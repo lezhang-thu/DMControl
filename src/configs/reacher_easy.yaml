@@ -58,8 +58,6 @@ seed: null
 gpuid: null
 seed_and_gpuid: [-1, 0]
 work_dir: ???
-save_buffer: false
-save_model: true
 detach_encoder: false
 # log
 log_interval: 100
