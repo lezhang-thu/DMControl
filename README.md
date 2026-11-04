@@ -2,7 +2,8 @@
 
 This guide describes the current `spr_sac` implementation and the experiment
 presets in [`src/configs`](src/configs). Training writes scalar metrics to the
-console and local JSON logs.
+console and local JSON logs. The default configurations include short on-policy
+rollouts in the SPR latent model, as described in section 7.
 
 ## 1. Create a conda environment
 
@@ -108,10 +109,12 @@ OMP_NUM_THREADS=1 python src/train.py \
   eval_freq=32 num_eval_episodes=1 \
   replay_buffer_capacity=32 batch_size=2 auxiliary_task_batch_size=2 \
   jumps=1 hidden_dim=16 encoder_feature_dim=8 latent_dim=16 \
-  transition_model_layer_width=16 num_layers=2 num_filters=4 log_interval=1
+  transition_model_layer_width=16 num_layers=2 num_filters=4 log_interval=1 \
+  imag_warmup=1 imag_batch_size=2
 ```
 
-This smoke test uses a small network and buffer. Use the presets below for the
+This smoke test uses a small network and buffer, and reduces the imagination
+warmup to exercise imagined actor and critic updates. Use the presets below for the
 full experiments. Training automatically uses CUDA when available and CPU
 otherwise.
 
@@ -235,3 +238,69 @@ records include `step`, `episode_reward`, `mean_episode_reward`, and
 `best_episode_reward`. Use `mean_episode_reward` at the same `step` to compare
 seeds and environments. Training writes these scalar logs only. It does not
 save model checkpoints or replay-buffer data.
+
+## 7. SPR world model and on-policy imagination
+
+The world model reuses SPR's existing latent transition model. Its dynamics
+continue to learn only from the original SPR prediction loss. Reward and
+continuation heads learn from detached latent features, so their losses cannot
+update the encoder or dynamics. The shared encoder retains its existing real
+SAC critic and SPR training. Imagined actor and critic losses also stop at
+latent features: no policy or value gradients train the world model.
+
+Reward regression predicts the reward for a transition; the continuation head
+predicts whether its arrival state permits bootstrapping. True terminations
+have continuation target zero, while time limits retain target one. The heads
+are trained on detached one-step model predictions and target-encoded next
+observations from real replay transitions, including terminal transitions.
+This is independent of SPR sequence sampling, which never crosses an episode reset.
+
+Each imagined update starts from real replay observations and samples fresh
+continuous actions from the current tanh-Gaussian actor for a short latent
+rollout. The actor uses a REINFORCE loss with detached advantages, an independently
+sampled value baseline, and an entropy term. The twin SAC Q heads fit detached
+soft lambda returns, using the target Q heads for bootstrapping. Continuation probabilities determine both return
+discounts and trajectory reach weights. Imagined transitions are used once,
+without adding them to replay. The regular real-data SAC updates continue.
+
+When imagination is enabled, the actor shares the critic's entire encoder,
+including its projection and layer normalization. This gives real observations
+and imagined latents the same coordinates for policy evaluation. Actor updates
+do not update that encoder. With imagination disabled, the original separate
+actor projection and shared convolutional layers are retained.
+
+The initial warmup follows `resprit` once: imagination has zero weight for the
+first `imag_warmup` successful SPR updates, then ramps linearly to full weight
+over the next `imag_warmup` updates. With the default value `2000`, this means
+2000 updates held off followed by 2000 updates of ramping. This counter is
+independent of `action_repeat`, environment episode resets, and the random-action
+collection period `init_steps`. No parameter resets or recurring warmups are
+added. Set `imag_warmup=0` to enable full imagination weight immediately.
+
+All seven configuration files expose these settings:
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `reward_loss_weight` | `1.0` | Detached reward-head regression weight |
+| `continue_loss_weight` | `1.0` | Detached continuation-head classification weight |
+| `imag_horizon` | `5` | Number of imagined transitions per rollout |
+| `imag_warmup` | `2000` | Successful SPR updates for initial hold and ramp |
+| `imag_lambda` | `0.95` | Mixing parameter for imagined lambda returns |
+| `imag_actor_weight` | `0.1` | Actor imagination loss weight at full ramp |
+| `imag_critic_weight` | `0.05` | Critic imagination loss weight at full ramp |
+| `imag_batch_size` | `128` | Maximum number of replay starts per imagined update |
+
+For a baseline run without outcome-head training or imagination, append:
+
+```bash
+imag_horizon=0 reward_loss_weight=0 continue_loss_weight=0
+```
+
+Training logs include `reward_loss`, `continue_loss`, `imag_actor_loss`,
+`imag_critic_loss`, `imag_return`, and `imag_continue`. The `imag_scale` metric
+tracks the one-time warmup/ramp, while `model_updates` counts successful SPR
+updates. Imagined-loss metrics appear only when imagination is active.
+
+The documented smoke command sets `imag_warmup=1` so its short run exercises
+both warmup and active imagination. The defaults are integration starting
+points; long-run learning performance has not been established by smoke tests.

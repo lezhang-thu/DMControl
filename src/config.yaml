@@ -51,8 +51,16 @@ time_offset: 0
 momentum_tau: 0.05
 aug_prob: 1.0
 fp_loss_weight: 1.0
-reward_loss_weight: 0.0
+reward_loss_weight: 1.0
+continue_loss_weight: 1.0
 auxiliary_task_lr: 1e-3
+# On-policy imagination: one initial warmup, counted in successful SPR updates.
+imag_horizon: 5
+imag_warmup: 2000
+imag_lambda: 0.95
+imag_actor_weight: 0.1
+imag_critic_weight: 0.05
+imag_batch_size: 128
 # misc
 seed: 1234
 gpuid: 0

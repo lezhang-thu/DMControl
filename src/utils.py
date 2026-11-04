@@ -201,62 +201,49 @@ class ReplayBuffer(Dataset):
 
         return obses, actions, curr_rewards, rewards, next_obses, not_dones
 
-    # v2
-    def sample_spr(self):   # sample batch for auxiliary task
-        idxs = np.random.randint(0,
-                                 self.capacity - self.jumps -
-                                 1 if self.full else self.idx - self.jumps - 1,
-                                 size=self.auxiliary_task_batch_size*2)
-                                #  size=self.auxiliary_task_batch_size)
-        idxs = idxs.reshape(-1, 1)
-        step = np.arange(self.jumps + 1).reshape(1, -1) # this is a range
-        idxs = idxs + step
+    def sample_spr(self):
+        """Sample SAC transitions and optional, episode-safe SPR sequences.
 
-        real_dones = torch.as_tensor(self.real_dones[idxs], device=self.device)   # (B, jumps+1, 1)
-        # we add this to avoid sampling the episode boundaries
-        valid_idxs = torch.where((real_dones.mean(1)==0).squeeze(-1))[0].cpu().numpy()
-        idxs = idxs[valid_idxs] # (B, jumps+1)
-        idxs = idxs[:self.auxiliary_task_batch_size] if idxs.shape[0] >= self.auxiliary_task_batch_size else idxs
-        self.current_auxiliary_batch_size = idxs.shape[0]
-
-        obses = torch.as_tensor(self.obses[idxs], device=self.device).float()   # (B, jumps+1, 3*3=9, 100, 100)
-        next_obses = torch.as_tensor(self.next_obses[idxs], device=self.device).float()
-        actions = torch.as_tensor(self.actions[idxs], device=self.device)
-        rewards = torch.as_tensor(self.rewards[idxs], device=self.device)
-        not_dones = torch.as_tensor(self.not_dones[idxs], device=self.device)   # (B, jumps+1, 1)
-    
-        spr_samples = {
-            'observation': obses.transpose(0, 1).unsqueeze(3),
-            'action': actions.transpose(0, 1),
-            'reward': rewards.transpose(0, 1),
-        }
+        Sequence indices are chronological offsets from the oldest retained
+        transition, so wrapping the ring cannot cross its overwrite boundary.
+        A sequence contains s_0..s_H and uses a_0..a_{H-1}; an episode ending
+        at transition H is therefore allowed. If no valid sequence is found
+        within the bounded sampling budget, SAC can still train normally.
+        """
+        size = self.capacity if self.full else self.idx
+        if size == 0:
+            raise ValueError("Cannot sample an empty replay buffer")
+        self.current_auxiliary_batch_size = 0
+        spr_samples = None
+        num_starts = size - self.jumps
+        if num_starts > 0 and self.auxiliary_task_batch_size > 0:
+            oldest = self.idx if self.full else 0
+            offsets = np.arange(self.jumps + 1)[None, :]
+            accepted = []
+            count = 0
+            # Bound work independently of replay capacity, and avoid copying
+            # invalid image sequences or transferring masks to the GPU.
+            for _ in range(4):
+                starts = np.random.randint(
+                    num_starts, size=2 * self.auxiliary_task_batch_size)
+                indices = (oldest + starts[:, None] + offsets) % self.capacity
+                valid = ~self.real_dones[indices[:, :self.jumps], 0].any(axis=1)
+                accepted.append(indices[valid])
+                count += int(valid.sum())
+                if count >= self.auxiliary_task_batch_size:
+                    break
+            if count:
+                indices = np.concatenate(accepted)[:self.auxiliary_task_batch_size]
+                self.current_auxiliary_batch_size = len(indices)
+                obses = torch.as_tensor(self.obses[indices], device=self.device).float()
+                actions = torch.as_tensor(self.actions[indices], device=self.device)
+                rewards = torch.as_tensor(self.rewards[indices], device=self.device)
+                spr_samples = {
+                    'observation': obses.transpose(0, 1).unsqueeze(3),
+                    'action': actions.transpose(0, 1),
+                    'reward': rewards.transpose(0, 1),
+                }
         return (*self.sample_aug(original_augment=True), spr_samples)
-
-    
-    # # v1
-    # def sample_spr(self):
-    #     idxs = np.random.randint(0,
-    #                              self.capacity - self.jumps -
-    #                              1 if self.full else self.idx - self.jumps - 1,
-    #                              size=self.auxiliary_task_batch_size)
-    #     idxs = idxs.reshape(-1, 1)
-    #     step = np.arange(self.jumps + 1).reshape(1, -1)
-    #     idxs = idxs + step
-    #     obses = torch.as_tensor(self.obses[idxs], device=self.device).float()
-    #     next_obses = torch.as_tensor(self.next_obses[idxs],
-    #                                  device=self.device).float()
-    #     actions = torch.as_tensor(self.actions[idxs], device=self.device)
-    #     rewards = torch.as_tensor(self.rewards[idxs], device=self.device)
-    #     not_dones = torch.as_tensor(self.not_dones[idxs], device=self.device)
-
-    #     spr_samples = {
-    #         'observation': obses.transpose(0, 1).unsqueeze(3),
-    #         'action': actions.transpose(0, 1),
-    #         'reward': rewards.transpose(0, 1),
-    #     }
-    #     # print(obses.transpose(0, 1).unsqueeze(3).size())
-    #     return (*self.sample_aug(original_augment=True), spr_samples)
-    
 
     def sample_aug(self, original_augment=False):
         idxs = np.random.randint(0,

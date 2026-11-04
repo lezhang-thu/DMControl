@@ -36,6 +36,30 @@ def squash(mu, pi, log_pi):
     return mu, pi, log_pi
 
 
+def imagined_lambda_return(rewards, continues, values, log_probs, discount,
+                           lamb, alpha):
+    """Soft lambda targets, time-major, with arrival rewards/continuations.
+
+    ``values`` are sampled target Q(s_t, a_t), including the final bootstrap.
+    Future policy entropy is included exactly once at every transition, so
+    horizon=1 agrees with the real SAC critic target.
+    """
+    returns = []
+    value = values[-1]
+    for t in reversed(range(rewards.shape[0])):
+        value = rewards[t] + discount * continues[t] * (
+            (1 - lamb) * values[t + 1] + lamb * value
+            - alpha * log_probs[t + 1])
+        returns.append(value)
+    return torch.stack(returns[::-1])
+
+
+def imagined_reach_weights(continues, discount):
+    """Probability/discount of reaching each action state; w(s_0) = 1."""
+    return torch.cat([torch.ones_like(continues[:1]),
+                      (discount * continues[:-1]).cumprod(dim=0)], dim=0)
+
+
 def weight_init(m):
     """Custom weight init for Conv2D and Linear layers."""
     if isinstance(m, nn.Linear):
@@ -82,14 +106,20 @@ class Actor(nn.Module):
                 detach_encoder=False):
         obs = self.encoder(obs, detach=detach_encoder)
 
-        mu, log_std = self.trunk(obs).chunk(2, dim=-1)
+        return self.forward_latent(obs, compute_pi, compute_log_pi)
+
+    def distribution_parameters(self, latent):
+        mu, log_std = self.trunk(latent).chunk(2, dim=-1)
 
         # constrain log_std inside [log_std_min, log_std_max]
         log_std = torch.tanh(log_std)
         log_std = self.log_std_min + 0.5 * (self.log_std_max -
                                             self.log_std_min) * (log_std + 1)
 
+        return mu, log_std
 
+    def forward_latent(self, latent, compute_pi=True, compute_log_pi=True):
+        mu, log_std = self.distribution_parameters(latent)
         if compute_pi:
             std = log_std.exp()
             noise = torch.randn_like(mu)
@@ -106,6 +136,13 @@ class Actor(nn.Module):
         mu, pi, log_pi = squash(mu, pi, log_pi)
 
         return mu, pi, log_pi, log_std
+
+    def log_prob_from_latent(self, latent, pre_tanh):
+        mu, log_std = self.distribution_parameters(latent)
+        sample = pre_tanh.detach()
+        log_prob = gaussian_logprob((sample - mu) / log_std.exp(), log_std)
+        correction = 2 * (np.log(2) - sample - F.softplus(-2 * sample))
+        return log_prob - correction.sum(-1, keepdim=True)
 
 
 
@@ -243,6 +280,16 @@ class SPR(nn.Module):
         self.reward_predictor = nn.Sequential(
             nn.Linear(encoder_feature_dim, 512), nn.LayerNorm(512), nn.ReLU(),
             nn.Linear(512, 1))
+        self.continue_predictor = nn.Sequential(
+            nn.Linear(encoder_feature_dim, 512), nn.LayerNorm(512), nn.ReLU(),
+            nn.Linear(512, 1))
+        nn.init.zeros_(self.reward_predictor[-1].weight)
+        nn.init.zeros_(self.reward_predictor[-1].bias)
+
+    def predict_outcomes(self, latent):
+        # Heads are readouts: neither supervised loss may shape the world model.
+        latent = latent.detach()
+        return self.reward_predictor(latent), self.continue_predictor(latent)
 
     def global_spr_loss(self, latents, target_latents, observation):
         global_latents = self.global_classifier(latents)  # proj
@@ -331,7 +378,14 @@ class SPRSacAgent(object):
             aug_prob=1.0,
             t0_spr_loss_weight=0.0,
             model_spr_weight=5.0,
-            reward_loss_weight=0.0,
+            reward_loss_weight=1.0,
+            continue_loss_weight=1.0,
+            imag_horizon=5,
+            imag_warmup=2000,
+            imag_lambda=0.95,
+            imag_actor_weight=0.1,
+            imag_critic_weight=0.05,
+            imag_batch_size=128,
             auxiliary_task_lr=1e-3,
             # sac
             hidden_dim=256,
@@ -371,6 +425,24 @@ class SPRSacAgent(object):
         self.model_spr_weight = model_spr_weight
         self.t0_spr_loss_weight = t0_spr_loss_weight
         self.reward_loss_weight = reward_loss_weight
+        self.continue_loss_weight = continue_loss_weight
+        if imag_horizon < 0 or imag_warmup < 0 or imag_batch_size < 1:
+            raise ValueError("Imagination horizon/warmup must be nonnegative and batch size positive")
+        if not 0 <= imag_lambda <= 1:
+            raise ValueError("imag_lambda must be in [0, 1]")
+        if min(reward_loss_weight, continue_loss_weight,
+               imag_actor_weight, imag_critic_weight) < 0:
+            raise ValueError("Loss weights must be nonnegative")
+        if imag_horizon and (encoder_type != 'pixel' or jumps < 1):
+            raise ValueError("Imagination requires the pixel SPR model with jumps >= 1")
+        self.imag_horizon = imag_horizon
+        self.imag_warmup = imag_warmup
+        self.imag_lambda = imag_lambda
+        self.imag_actor_weight = imag_actor_weight
+        self.imag_critic_weight = imag_critic_weight
+        self.imag_batch_size = imag_batch_size
+        self.model_updates = 0
+        self.return_quantiles = None
 
         self.actor = Actor(obs_shape, action_shape, hidden_dim, encoder_type,
                            encoder_feature_dim, actor_log_std_min,
@@ -388,7 +460,11 @@ class SPRSacAgent(object):
         self.critic_target.load_state_dict(self.critic.state_dict())
 
         # tie encoders between actor and critic
-        self.actor.encoder.copy_conv_weights_from(self.critic.encoder)
+        if self.imag_horizon:
+            # Real and imagined policies must consume the same SPR latent space.
+            self.actor.encoder = self.critic.encoder
+        else:
+            self.actor.encoder.copy_conv_weights_from(self.critic.encoder)
 
         self.log_alpha = torch.tensor(np.log(init_temperature)).to(device)
         self.log_alpha.requires_grad = True
@@ -396,7 +472,9 @@ class SPRSacAgent(object):
         self.target_entropy = -np.prod(action_shape)
 
         # optimizers
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(),
+        actor_parameters = (self.actor.trunk.parameters() if self.imag_horizon
+                            else self.actor.parameters())
+        self.actor_optimizer = torch.optim.Adam(actor_parameters,
                                                 lr=actor_lr,
                                                 betas=(actor_beta, 0.999))
 
@@ -426,8 +504,15 @@ class SPRSacAgent(object):
             # optimizer for critic encoder and spr loss
             self.encoder_optimizer = torch.optim.Adam(
                 self.critic.encoder.parameters(), lr=2 * encoder_lr)
-            self.spr_optimizer = torch.optim.Adam(self.SPR.parameters(),
-                                                  lr=auxiliary_task_lr)
+            # Dedicated head optimizer, disjoint from the original SPR optimizer.
+            head_parameters = list(self.SPR.reward_predictor.parameters()) + list(
+                self.SPR.continue_predictor.parameters())
+            head_ids = {id(parameter) for parameter in head_parameters}
+            self.spr_optimizer = torch.optim.Adam(
+                [p for p in self.SPR.parameters() if id(p) not in head_ids],
+                lr=auxiliary_task_lr)
+            self.world_head_optimizer = torch.optim.Adam(
+                head_parameters, lr=auxiliary_task_lr)
 
         self.train()
         self.critic_target.train()
@@ -486,8 +571,15 @@ class SPRSacAgent(object):
 
     def update_actor_and_alpha(self, obs, L, step):
         # detach encoder, so we don't update it with the actor loss
-        _, pi, log_pi, log_std = self.actor(obs, detach_encoder=True)
-        actor_Q1, actor_Q2 = self.critic(obs, pi, detach_encoder=True)
+        if self.imag_horizon:
+            with torch.no_grad():
+                latent = self.critic.encoder(obs)
+            _, pi, log_pi, log_std = self.actor.forward_latent(latent)
+            actor_Q1 = self.critic.Q1(latent, pi)
+            actor_Q2 = self.critic.Q2(latent, pi)
+        else:
+            _, pi, log_pi, log_std = self.actor(obs, detach_encoder=True)
+            actor_Q1, actor_Q2 = self.critic(obs, pi, detach_encoder=True)
 
         actor_Q = torch.min(actor_Q1, actor_Q2)
         actor_loss = (self.alpha.detach() * log_pi - actor_Q).mean()
@@ -520,45 +612,14 @@ class SPRSacAgent(object):
         observation = spr_kwargs["observation"]
         # [1+self.jumps, B, dim_A]
         action = spr_kwargs["action"]
-        # [1+self.jumps, 1]
-        reward = spr_kwargs["reward"]
-
-        pred_reward = []
         pred_latents = []
-
-        input_obs = observation[0].flatten(1, 2)
-        input_obs = self.SPR.transform(input_obs, augment=True)
-
-        # stem forward
-        lead_dim, T, B, img_shape = utils.infer_leading_dims(input_obs, 3)
-        latent = self.SPR.encoder(input_obs.reshape(
-            T * B, *img_shape))  # Fold if T dimension.
-
-        # spr loss
+        input_obs = self.SPR.transform(observation[0].flatten(1, 2), augment=True)
+        latent = self.SPR.encoder(input_obs)
         pred_latents.append(latent)
-        if self.jumps > 0:
-            pred_rew = self.SPR.reward_predictor(pred_latents[0])
-            pred_reward.append(F.log_softmax(pred_rew, -1))
-
-            for j in range(1, self.jumps + 1):
-                latent = self.SPR.transition_model.sample_prediction(
-                    torch.cat([latent, action[j - 1]], dim=1))
-                pred_rew = self.SPR.reward_predictor(
-                    latent)[:observation.shape[1]]
-                pred_latents.append(latent)
-                pred_reward.append(F.log_softmax(pred_rew, -1))
-
-        # pred_reward loss
-        if len(pred_reward) > 0:
-            pred_reward = torch.stack(pred_reward, 0)
-            with torch.no_grad():
-                reward_target = utils.to_categorical(
-                    reward[:self.jumps + 1].flatten().to(self.device),
-                    limit=0).reshape(*pred_reward.shape)
-            reward_loss = -torch.sum(reward_target * pred_reward,
-                                     2).mean(0).cpu()
-        else:
-            reward_loss = torch.zeros(observation.shape[1], )
+        for j in range(self.jumps):
+            latent = self.SPR.transition_model.sample_prediction(
+                torch.cat([latent, action[j]], dim=1))
+            pred_latents.append(latent)
 
         spr_loss = self.SPR.do_spr_loss(pred_latents, observation)
         if self.jumps > 0:
@@ -569,8 +630,7 @@ class SPRSacAgent(object):
             model_spr_loss = torch.zeros_like(spr_loss)
 
         final_spr_loss = self.t0_spr_loss_weight * t0_spr_loss.mean() + \
-            self.model_spr_weight * model_spr_loss.mean() + \
-            self.reward_loss_weight * reward_loss.mean().to(self.device)
+            self.model_spr_weight * model_spr_loss.mean()
 
         self.encoder_optimizer.zero_grad()
         self.spr_optimizer.zero_grad()
@@ -580,6 +640,120 @@ class SPRSacAgent(object):
 
         if step % self.log_interval == 0:
             L.log('train/spr_loss', final_spr_loss, step)
+
+    @property
+    def imagination_scale(self):
+        # A single initial warmup and ramp, counted in successful SPR updates.
+        if not self.imag_horizon:
+            return 0.0
+        if self.imag_warmup == 0:
+            return 1.0
+        return float(np.clip((self.model_updates - self.imag_warmup) /
+                             self.imag_warmup, 0.0, 1.0))
+
+    def update_world_heads(self, obs, action, reward, next_obs, not_done, L, step):
+        # Use unrestricted real transitions, including true terminations. The
+        # SPR sequence sampler excludes boundaries and cannot teach c=0 alone.
+        with torch.no_grad():
+            latent = self.SPR.encoder(obs)
+            predicted_next = self.SPR.transition_model.sample_prediction(
+                torch.cat([latent, action], dim=-1))
+            real_next = self.SPR.target_encoder(next_obs)
+        pred_reward, pred_continue = self.SPR.predict_outcomes(predicted_next)
+        real_reward, real_continue = self.SPR.predict_outcomes(real_next)
+        reward_loss = (F.mse_loss(pred_reward, reward) +
+                       F.mse_loss(real_reward, reward))
+        continue_loss = (F.binary_cross_entropy_with_logits(pred_continue, not_done) +
+                         F.binary_cross_entropy_with_logits(real_continue, not_done))
+        loss = (self.reward_loss_weight * reward_loss +
+                self.continue_loss_weight * continue_loss)
+        self.world_head_optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        self.world_head_optimizer.step()
+        if step % self.log_interval == 0:
+            L.log('train/reward_loss', reward_loss, step)
+            L.log('train/continue_loss', continue_loss, step)
+
+    @torch.no_grad()
+    def imagine(self, obs):
+        """Fresh on-policy trajectories; no graph through the world model."""
+        latent = self.SPR.encoder(obs[:self.imag_batch_size])
+        latents, actions, pre_tanh, rewards, continues, values, log_probs = (
+            [] for _ in range(7))
+        for t in range(self.imag_horizon + 1):
+            latents.append(latent)
+            mu, log_std = self.actor.distribution_parameters(latent)
+            sample = mu + log_std.exp() * torch.randn_like(mu)
+            action = sample.tanh()
+            log_probs.append(self.actor.log_prob_from_latent(latent, sample))
+            # Target Q heads read the same model states as the online Q heads.
+            values.append(torch.minimum(self.critic_target.Q1(latent, action),
+                                        self.critic_target.Q2(latent, action)))
+            if t == self.imag_horizon:
+                break
+            actions.append(action)
+            pre_tanh.append(sample)
+            latent = self.SPR.transition_model.sample_prediction(
+                torch.cat([latent, action], dim=-1))
+            reward, continuation = self.SPR.predict_outcomes(latent)
+            rewards.append(reward)
+            continues.append(continuation.sigmoid())
+        return dict(latents=torch.stack(latents), actions=torch.stack(actions),
+                    pre_tanh=torch.stack(pre_tanh), rewards=torch.stack(rewards),
+                    continues=torch.stack(continues), values=torch.stack(values),
+                    log_probs=torch.stack(log_probs))
+
+    def update_imagination(self, obs, L, step, scale=1.0):
+        if not self.imag_horizon or scale <= 0:
+            return
+        rollout = self.imagine(obs)
+        with torch.no_grad():
+            targets = imagined_lambda_return(
+                rollout['rewards'], rollout['continues'], rollout['values'],
+                rollout['log_probs'], self.discount, self.imag_lambda,
+                self.alpha.detach())
+            weights = imagined_reach_weights(rollout['continues'], self.discount)
+            quantiles = torch.quantile(targets.flatten(), targets.new_tensor([0.05, 0.95]))
+            if self.return_quantiles is None:
+                self.return_quantiles = quantiles
+            else:
+                self.return_quantiles.lerp_(quantiles, 0.01)
+            normalization = (self.return_quantiles[1] - self.return_quantiles[0]).clamp_min(1)
+            latent = rollout['latents'][:-1].flatten(0, 1)
+            # The score-function baseline must be independent of the rollout
+            # action. Reusing Q(s, a_rollout) would cancel the policy signal.
+            _, baseline_action, _, _ = self.actor.forward_latent(latent)
+            baseline = torch.minimum(self.critic_target.Q1(latent, baseline_action),
+                                     self.critic_target.Q2(latent, baseline_action))
+            advantages = (targets - baseline.reshape_as(targets)) / normalization
+
+        latent = rollout['latents'][:-1].flatten(0, 1)
+        actions = rollout['actions'].flatten(0, 1)
+        weight = weights.flatten(0, 1)
+        target = targets.flatten(0, 1)
+        q1, q2 = self.critic.Q1(latent, actions), self.critic.Q2(latent, actions)
+        critic_loss = (weight * ((q1 - target).square() + (q2 - target).square())).mean()
+        if self.imag_critic_weight:
+            self.critic_optimizer.zero_grad(set_to_none=True)
+            (scale * self.imag_critic_weight * critic_loss).backward()
+            self.critic_optimizer.step()
+
+        log_prob = self.actor.log_prob_from_latent(
+            latent, rollout['pre_tanh'].flatten(0, 1))
+        # A separate reparameterized sample estimates the squashed policy's
+        # entropy gradient; REINFORCE above treats rollout actions as constants.
+        _, _, entropy_log_prob, _ = self.actor.forward_latent(latent)
+        actor_loss = (weight * (-log_prob * advantages.flatten(0, 1) +
+                               self.alpha.detach() * entropy_log_prob)).mean()
+        if self.imag_actor_weight:
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            (scale * self.imag_actor_weight * actor_loss).backward()
+            self.actor_optimizer.step()
+        if step % self.log_interval == 0:
+            L.log('train/imag_actor_loss', actor_loss, step)
+            L.log('train/imag_critic_loss', critic_loss, step)
+            L.log('train/imag_return', targets.mean(), step)
+            L.log('train/imag_continue', rollout['continues'].mean(), step)
 
     def update(self, replay_buffer, L, step):
         if self.encoder_type == 'pixel':
@@ -593,10 +767,21 @@ class SPRSacAgent(object):
             L.log('train/batch_reward', reward.mean(), step)
         self.update_critic(obs, action, reward, next_obs, not_done, L, step)
         if self.encoder_type == 'pixel':
-            self.update_spr(spr_kwargs, L, step)
+            if spr_kwargs is not None:
+                self.update_spr(spr_kwargs, L, step)
+                self.model_updates += 1
+            if self.reward_loss_weight or self.continue_loss_weight:
+                self.update_world_heads(obs, action, reward, next_obs, not_done, L, step)
 
         if step % self.actor_update_freq == 0:
             self.update_actor_and_alpha(obs, L, step)
+
+        if self.encoder_type == 'pixel':
+            scale = self.imagination_scale
+            if step % self.log_interval == 0:
+                L.log('train/imag_scale', scale, step)
+                L.log('train/model_updates', self.model_updates, step)
+            self.update_imagination(obs, L, step, scale)
 
         if step % self.critic_target_update_freq == 0:
             utils.soft_update_params(self.critic.Q1, self.critic_target.Q1,

@@ -70,22 +70,23 @@ class ProbabilisticTransitionModel(nn.Module):
         return mu + sigma * eps
 
 
-class EnsembleOfProbabilisticTransitionModels(object):
+class EnsembleOfProbabilisticTransitionModels(nn.Module):
     def __init__(self,
                  encoder_feature_dim,
                  action_shape,
                  layer_width,
                  ensemble_size=5):
-        self.models = [
+        super().__init__()
+        self.models = nn.ModuleList([
             ProbabilisticTransitionModel(encoder_feature_dim,
                                          action_shape,
                                          layer_width,
                                          announce=False)
             for _ in range(ensemble_size)
-        ]
+        ])
         print("Ensemble of probabilistic transition models chosen.")
 
-    def __call__(self, x):
+    def forward(self, x):
         mu_sigma_list = [model.forward(x) for model in self.models]
         mus, sigmas = zip(*mu_sigma_list)
         mus, sigmas = torch.stack(mus), torch.stack(sigmas)
@@ -94,19 +95,6 @@ class EnsembleOfProbabilisticTransitionModels(object):
     def sample_prediction(self, x):
         model = random.choice(self.models)
         return model.sample_prediction(x)
-
-    def to(self, device):
-        for model in self.models:
-            model.to(device)
-        return self
-
-    def parameters(self):
-        list_of_parameters = [
-            list(model.parameters()) for model in self.models
-        ]
-        parameters = [p for ps in list_of_parameters for p in ps]
-        return parameters
-
 
 _AVAILABLE_TRANSITION_MODELS = {
     '': DeterministicTransitionModel,
