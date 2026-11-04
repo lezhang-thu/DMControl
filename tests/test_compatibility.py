@@ -226,11 +226,18 @@ class AgentTests(NumericalTestCase):
                          agent.critic.encoder.feature_dim + 2)
 
         def ids(optimizer):
-            return {id(parameter) for parameter in optimizer.param_groups[0]["params"]}
+            return {id(parameter) for group in optimizer.param_groups
+                    for parameter in group["params"]}
 
         actor_ids = ids(agent.actor_optimizer)
         critic_ids = ids(agent.critic_optimizer)
         spr_ids = ids(agent.spr_optimizer)
+        encoder_ids = {id(parameter) for parameter in agent.critic.encoder.parameters()}
+        self.assertEqual(ids(agent.encoder_optimizer), encoder_ids)
+        self.assertTrue(encoder_ids <= actor_ids)
+        self.assertTrue(encoder_ids <= critic_ids)
+        self.assertTrue(encoder_ids.isdisjoint(spr_ids),
+                        "The shared encoder must receive only one SPR optimizer step")
         self.assertIn(id(agent.critic.encoder.fc.weight), actor_ids)
         self.assertIn(id(agent.SPR.pi_proj[0].weight), actor_ids)
         self.assertNotIn(id(agent.SPR.transition_model.fc.weight), actor_ids)
@@ -313,6 +320,7 @@ class AgentTests(NumericalTestCase):
         for step, transition_input in enumerate(seen):
             torch.testing.assert_close(transition_input[:, feature_dim:],
                                        spr_kwargs["action"][step])
+        self.assertTrue(changed(before, "encoder"))
         self.assertTrue(changed(before, "transition"))
         self.assertTrue(changed(before, "q_predictor"))
         self.assertTrue(changed(before, "pi_predictor"))

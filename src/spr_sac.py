@@ -407,12 +407,14 @@ class SPRSacAgent(object):
             actor_parameters += list(self.SPR.pi_proj.parameters())
             actor_parameters += list(self.critic.encoder.parameters())
             critic_parameters += list(self.SPR.q_proj.parameters())
-            # optimizer for critic encoder and spr loss
+            # The shared encoder gets one SPR step, through this optimizer only.
+            encoder_parameters = list(self.critic.encoder.parameters())
             self.encoder_optimizer = torch.optim.Adam(
-                self.critic.encoder.parameters(), lr=2 * encoder_lr)
+                encoder_parameters, lr=2 * encoder_lr)
+            encoder_parameter_ids = {id(parameter) for parameter in encoder_parameters}
             spr_parameters = [
                 parameter for parameter in self.SPR.parameters()
-                if parameter.requires_grad
+                if parameter.requires_grad and id(parameter) not in encoder_parameter_ids
             ]
             self.spr_optimizer = torch.optim.Adam(spr_parameters,
                                                   lr=auxiliary_task_lr)

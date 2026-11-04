@@ -115,3 +115,13 @@ Parameter updates:
 The real actor loss reaches the encoder from the current frame, through `pi_proj`. It does not enter the transition. `update_critic` steps `q_proj` before `update_spr` clears the SPR optimizer. `update_actor_and_alpha` steps `pi_proj` and the encoder after the SPR step. The predictors stay in the SPR optimizer only.
 
 The disabled reward predictor is left untouched.
+
+## Follow-up: one encoder update per SPR loss
+
+Review found that `SPR.encoder` and `critic.encoder` are the same module, so collecting all `SPR.parameters()` also put the shared encoder in `spr_optimizer`. Together with `encoder_optimizer`, this applied two Adam updates to the encoder from the same SPR backward pass. This overlap predates `fa12903`.
+
+The shared encoder parameters are now excluded from `spr_optimizer` by parameter identity. During `update_spr`, `encoder_optimizer` alone applies the encoder update at its existing learning rate of `2 * encoder_lr`. The transition, both online projections, and both predictors continue to receive their SPR updates through `spr_optimizer` at `auxiliary_task_lr`. The disabled reward predictor is unchanged.
+
+The real critic and real actor optimizers still include the shared encoder and train it from their respective losses. Only the duplicate encoder update from the SPR loss is removed. No imaginary learning is added; the SPR rollout continues to use replay actions.
+
+The regression check verifies that all shared encoder parameters belong to `encoder_optimizer`, remain in the actor and critic optimizers, and are absent from `spr_optimizer`. It also verifies that the encoder still changes during the SPR update.
