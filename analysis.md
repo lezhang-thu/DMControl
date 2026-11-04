@@ -67,3 +67,51 @@ The imagination weights are also on a different clock than in ReSPRIT. This lear
 3. Use the reparameterized SAC actor loss and a scalar λ-return for the twin Qs inside the rollout, with the latent detached at every step.
 4. Decide whether the λ-return bootstraps the soft target `min Q_target - α log π` or the plain expected Q used in ReSPRIT.
 5. Run the imagination weight gate once: 0 for `imag_warmup` gradient steps, linear ramp over the next `imag_warmup`, and choose that count against the one-update-per-action budget.
+
+## Updated plan for the two representation mismatches
+
+This replaces the earlier proposal that kept the actor loss off the shared encoder. Imagination, reward heads, and continue heads stay out of this step. The SPR rollout uses replay actions.
+
+One pixel encoder remains: `critic.encoder`. The actor encoder and `copy_conv_weights_from` go away. Call its output `z`.
+
+The transition stays in that raw space. With the replay action `a_k` from `sample_spr`,
+
+`z_0 = encoder(o_0)`, then `z_{k+1} = T(z_k, a_k)`.
+
+Each control head gets its own projection of `z`, with its own predictor and its own target projection:
+
+| Branch | Online projection | Predictor | Target projection | Who reads the projection |
+| --- | --- | --- | --- | --- |
+| Q | `q_proj` | `q_predictor` | `q_proj_target` | critic |
+| Policy | `pi_proj` | `pi_predictor` | `pi_proj_target` | actor trunk |
+
+Each module has the same shape as today's `global_classifier`: `feature_dim → latent_dim → feature_dim`. The single `global_classifier`, `global_target_classifier`, and `global_final_classifier` are removed. Branch width stays `encoder_feature_dim`, so the Q input width and the trunk input width stay as they are.
+
+`q_proj(z)` is the critic feature. `pi_proj(z)` is the actor feature. Both are functions of the same `z`. The heads do not read the raw transition output, and they do not read the predictor output.
+
+For every latent in the open-loop rollout, including `z_0`:
+
+- Q term: normalize `q_predictor(q_proj(z_k))` and match `q_proj_target(target_encoder(o_k))`.
+- Policy term: normalize `pi_predictor(pi_proj(z_k))` and match `pi_proj_target(target_encoder(o_k))`.
+
+Each target projection is stop-gradient, as `global_target_classifier` is today. Each branch is normalized on its own. The branch loss is the squared error of those unit vectors, the same cosine form as `spr_loss`. The SPR loss is the sum of the two branch losses.
+
+The existing split between the first step and the later steps stays. `t0_spr_loss_weight` and `model_spr_weight` multiply that sum. Both branches have equal weight inside the sum.
+
+On a real critic update, `Q` takes `q_proj(encoder(obs))` concatenated with the replay action. The Bellman target takes `q_proj_target(critic_target.encoder(next_obs))` concatenated with the target action. The target action still comes from the current actor, as in `update_critic`.
+
+On a real actor update, the trunk takes `pi_proj(z)` and the gradient continues into the shared encoder. This matches the real-data policy path in ReSPRIT: `policy_logits_from_feature` reads the online encoding with no stop-gradient, and only the advantage Q values are stopped. `detach_encoder=True` in `update_actor_and_alpha` is not used on this path. Sampling stays inside `update_actor_and_alpha`. It is the existing SAC actor sample, and it is not an input to the transition.
+
+`q_proj_target` and `pi_proj_target` are exponential-moving-average copies of the online projections, updated with `momentum_tau` in the same place as `global_target_classifier`. The predictors are online only and are not copied into a target.
+
+Parameter updates:
+
+- The transition is trained only by the two SPR terms.
+- The predictors are trained only by their own SPR term.
+- `q_proj` is trained by the Q-branch SPR term and by the real critic loss.
+- `pi_proj` is trained by the policy-branch SPR term and by the real actor loss.
+- The shared encoder is trained by the real critic loss, the two SPR terms, and the real actor loss.
+
+The real actor loss reaches the encoder from the current frame, through `pi_proj`. It does not enter the transition. `update_critic` steps `q_proj` before `update_spr` clears the SPR optimizer. `update_actor_and_alpha` steps `pi_proj` and the encoder after the SPR step. The predictors stay in the SPR optimizer only.
+
+The disabled reward predictor is left untouched.

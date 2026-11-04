@@ -216,6 +216,121 @@ class AgentTests(NumericalTestCase):
         self.assertEqual(action.shape, (2,))
         self.assertTrue(np.all(np.abs(action) <= 1.0))
 
+    def test_shared_encoder_two_branches_and_replay_transition_actions(self):
+        agent = make_agent()
+        self.assertIs(agent.SPR.encoder, agent.critic.encoder)
+        self.assertFalse(hasattr(agent.actor, "encoder"))
+        self.assertEqual(agent.critic.Q1.trunk[0].in_features,
+                         agent.critic.encoder.feature_dim + 2)
+        self.assertEqual(agent.critic.Q2.trunk[0].in_features,
+                         agent.critic.encoder.feature_dim + 2)
+
+        def ids(optimizer):
+            return {id(parameter) for parameter in optimizer.param_groups[0]["params"]}
+
+        actor_ids = ids(agent.actor_optimizer)
+        critic_ids = ids(agent.critic_optimizer)
+        spr_ids = ids(agent.spr_optimizer)
+        self.assertIn(id(agent.critic.encoder.fc.weight), actor_ids)
+        self.assertIn(id(agent.SPR.pi_proj[0].weight), actor_ids)
+        self.assertNotIn(id(agent.SPR.transition_model.fc.weight), actor_ids)
+        self.assertNotIn(id(agent.SPR.pi_predictor[0].weight), actor_ids)
+        self.assertNotIn(id(agent.SPR.q_proj[0].weight), actor_ids)
+        self.assertIn(id(agent.SPR.q_proj[0].weight), critic_ids)
+        self.assertIn(id(agent.critic.Q1.trunk[0].weight), critic_ids)
+        self.assertIn(id(agent.critic.Q2.trunk[0].weight), critic_ids)
+        self.assertNotIn(id(agent.SPR.q_predictor[0].weight), critic_ids)
+        self.assertNotIn(id(agent.SPR.pi_proj[0].weight), critic_ids)
+        for parameter in (agent.SPR.q_predictor[0].weight,
+                          agent.SPR.pi_predictor[0].weight,
+                          agent.SPR.q_proj[0].weight,
+                          agent.SPR.pi_proj[0].weight,
+                          agent.SPR.transition_model.fc.weight,
+                          agent.SPR.reward_predictor[0].weight):
+            self.assertIn(id(parameter), spr_ids)
+        self.assertNotIn(id(agent.SPR.q_proj_target[0].weight), spr_ids)
+        self.assertNotIn(id(agent.SPR.pi_proj_target[0].weight), spr_ids)
+        self.assertNotIn(id(agent.critic.Q1.trunk[0].weight), spr_ids)
+
+        buffer = make_buffer()
+        for _ in range(12):
+            observation = np.random.randint(0, 256, (9, 100, 100), dtype=np.uint8)
+            next_observation = np.random.randint(0, 256, observation.shape, dtype=np.uint8)
+            buffer.add(observation, np.random.uniform(-1, 1, 2).astype(np.float32),
+                       1.0, next_observation, False)
+        buffer.add_agent(agent)
+        obs, replay_action, reward, next_obs, not_done, spr_kwargs = buffer.sample_spr()
+        logger = Logger(tempfile.mkdtemp())  # scalar logs only; the directory is disposable
+
+        def snapshot():
+            names = {
+                "encoder": agent.critic.encoder.fc.weight,
+                "q1": agent.critic.Q1.trunk[0].weight,
+                "q2": agent.critic.Q2.trunk[0].weight,
+                "q_proj": agent.SPR.q_proj[0].weight,
+                "pi_proj": agent.SPR.pi_proj[0].weight,
+                "q_predictor": agent.SPR.q_predictor[0].weight,
+                "pi_predictor": agent.SPR.pi_predictor[0].weight,
+                "transition": agent.SPR.transition_model.fc.weight,
+            }
+            return {name: tensor.detach().clone() for name, tensor in names.items()}
+
+        def changed(before, name):
+            current = {
+                "encoder": agent.critic.encoder.fc.weight,
+                "q1": agent.critic.Q1.trunk[0].weight,
+                "q2": agent.critic.Q2.trunk[0].weight,
+                "q_proj": agent.SPR.q_proj[0].weight,
+                "pi_proj": agent.SPR.pi_proj[0].weight,
+                "q_predictor": agent.SPR.q_predictor[0].weight,
+                "pi_predictor": agent.SPR.pi_predictor[0].weight,
+                "transition": agent.SPR.transition_model.fc.weight,
+            }[name]
+            return not torch.equal(current.detach(), before[name])
+
+        before = snapshot()
+        agent.update_critic(obs, replay_action, reward, next_obs, not_done, logger, 1)
+        self.assertTrue(changed(before, "q1"))
+        self.assertTrue(changed(before, "q2"))
+        self.assertTrue(changed(before, "q_proj"))
+        self.assertTrue(changed(before, "encoder"))
+        self.assertFalse(changed(before, "transition"))
+        self.assertFalse(changed(before, "pi_proj"))
+        self.assertFalse(changed(before, "pi_predictor"))
+
+        seen = []
+        original = agent.SPR.transition_model.sample_prediction
+
+        def record(transition_input):
+            seen.append(transition_input.detach().clone())
+            return original(transition_input)
+
+        agent.SPR.transition_model.sample_prediction = record
+        before = snapshot()
+        agent.update_spr(spr_kwargs, logger, 1)
+        feature_dim = agent.critic.encoder.feature_dim
+        self.assertEqual(len(seen), agent.jumps)
+        for step, transition_input in enumerate(seen):
+            torch.testing.assert_close(transition_input[:, feature_dim:],
+                                       spr_kwargs["action"][step])
+        self.assertTrue(changed(before, "transition"))
+        self.assertTrue(changed(before, "q_predictor"))
+        self.assertTrue(changed(before, "pi_predictor"))
+        self.assertTrue(changed(before, "q_proj"))
+        self.assertTrue(changed(before, "pi_proj"))
+        self.assertFalse(changed(before, "q1"))
+
+        seen.clear()
+        before = snapshot()
+        agent.update_actor_and_alpha(obs, logger, 1)
+        self.assertEqual(seen, [])
+        self.assertTrue(changed(before, "encoder"))
+        self.assertTrue(changed(before, "pi_proj"))
+        self.assertFalse(changed(before, "transition"))
+        self.assertFalse(changed(before, "q_proj"))
+        self.assertFalse(changed(before, "q_predictor"))
+        self.assertFalse(changed(before, "pi_predictor"))
+
 
 class PixelEnv(gym.Env):
     observation_space = gym.spaces.Box(0, 255, shape=(3, 4, 4), dtype=np.uint8)
