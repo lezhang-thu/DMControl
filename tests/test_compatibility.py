@@ -327,6 +327,50 @@ class AgentTests(NumericalTestCase):
         self.assertIsNone(projector.grad)
         self.assertIsNone(reward_head.grad)
 
+    def test_imaginary_actor_reuses_rollout_actions(self):
+        agent = make_agent()
+        buffer = make_buffer()
+        for _ in range(12):
+            observation = np.random.randint(0, 256, (9, 100, 100), dtype=np.uint8)
+            buffer.add(observation, np.random.uniform(-1, 1, 2).astype(np.float32),
+                       1.0, observation, False)
+        buffer.add_agent(agent)
+        obs, _, _, _, _, _ = buffer.sample_spr()
+        _, value_loss = agent._imagination_losses(obs, with_actor=False)
+        value_loss.backward()
+        agent.critic_optimizer.step()
+        rollout = agent._imag_rollout
+        with torch.no_grad():
+            expected = [
+                agent.actor(rollout["features"][index],
+                            noise=rollout["noises"][index])[1]
+                for index in range(rollout["features"].shape[0])
+            ]
+        fresh = {"count": 0}
+        seen = []
+        original = agent.actor.forward
+
+        def wrapped(feature, compute_pi=True, compute_log_pi=True, noise=None):
+            if noise is None and compute_pi:
+                fresh["count"] += 1
+            mu, action, log_prob, log_std = original(
+                feature, compute_pi=compute_pi, compute_log_pi=compute_log_pi,
+                noise=noise)
+            if noise is not None:
+                seen.append(action.detach())
+            return mu, action, log_prob, log_std
+
+        agent.actor.forward = wrapped
+        actor_loss, reused_value_loss = agent._imagination_losses(
+            obs, with_actor=True)
+        self.assertIsNone(reused_value_loss)
+        self.assertEqual(fresh["count"], 0)
+        self.assertEqual(len(seen), len(expected))
+        for action, target in zip(seen, expected):
+            torch.testing.assert_close(action, target)
+        actor_loss.backward()
+        self.assertIsNotNone(agent.actor.trunk[0].weight.grad)
+
 
 class PixelEnv(gym.Env):
     observation_space = gym.spaces.Box(0, 255, shape=(3, 4, 4), dtype=np.uint8)

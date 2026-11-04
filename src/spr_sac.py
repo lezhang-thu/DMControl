@@ -84,7 +84,7 @@ class Actor(nn.Module):
 
         self.apply(weight_init)
 
-    def forward(self, feature, compute_pi=True, compute_log_pi=True):
+    def forward(self, feature, compute_pi=True, compute_log_pi=True, noise=None):
         mu, log_std = self.trunk(feature).chunk(2, dim=-1)
 
         # constrain log_std inside [log_std_min, log_std_max]
@@ -95,7 +95,8 @@ class Actor(nn.Module):
 
         if compute_pi:
             std = log_std.exp()
-            noise = torch.randn_like(mu)
+            if noise is None:
+                noise = torch.randn_like(mu)
             pi = mu + noise * std
         else:
             pi = None
@@ -386,6 +387,7 @@ class SPRSacAgent(object):
         self.imag_value_weight = imag_value_weight
         self.imag_lambda = imag_lambda
         self.grad_steps = 0
+        self._imag_rollout = None
 
         self.critic = Critic(obs_shape, action_shape, hidden_dim, encoder_type,
                              encoder_feature_dim, num_layers,
@@ -516,24 +518,34 @@ class SPRSacAgent(object):
             logger.log('train/imag_scale', scale, step)
         return scale
 
-    def _imagination_losses(self, obs, with_actor):
-        """On-policy SAC losses inside a short latent rollout.
+    def _imagination_rollout(self, obs):
+        """On-policy latent rollout for the imagination losses.
 
         Every latent is detached, so these losses do not train the encoder
-        or the transition. The reward readout is detached as well.
+        or the transition. The reward readout is detached as well. The
+        stored features and noises reproduce the rollout actions later,
+        after the critic step has updated Q.
         """
         horizon = self.jumps
         latent = self.critic.encoder(obs).detach()
+        action_dim = self.actor.trunk[-1].out_features // 2
         rewards = []
         values = []
         online_q1 = []
         online_q2 = []
-        actor_terms = []
+        features = []
+        noises = []
         for _ in range(horizon):
             feature = self._project(latent)
-            _, action, log_prob, _ = self.actor(feature.detach())
+            actor_feature = feature.detach()
+            noise = torch.randn(actor_feature.shape[0], action_dim,
+                                device=actor_feature.device,
+                                dtype=actor_feature.dtype)
+            _, action, log_prob, _ = self.actor(actor_feature, noise=noise)
+            action = action.detach()
+            log_prob = log_prob.detach()
             nxt = self.SPR.transition_model.sample_prediction(
-                torch.cat([latent, action.detach()], dim=1)).detach()
+                torch.cat([latent, action], dim=1)).detach()
             rewards.append(self.SPR.reward_head(nxt).detach())
             with torch.no_grad():
                 target_feature = self._project(latent, target=True)
@@ -542,13 +554,10 @@ class SPRSacAgent(object):
                 values.append(
                     torch.min(target_q1, target_q2) -
                     self.alpha.detach() * log_prob)
-            online_q1.append(self.critic.Q1(feature, action.detach()))
-            online_q2.append(self.critic.Q2(feature, action.detach()))
-            if with_actor:
-                actor_q1 = self.critic.Q1(feature.detach(), action)
-                actor_q2 = self.critic.Q2(feature.detach(), action)
-                actor_terms.append(self.alpha.detach() * log_prob -
-                                   torch.min(actor_q1, actor_q2))
+            online_q1.append(self.critic.Q1(feature, action))
+            online_q2.append(self.critic.Q2(feature, action))
+            features.append(actor_feature)
+            noises.append(noise)
             latent = nxt
         with torch.no_grad():
             _, final_action, final_log_prob, _ = self.actor(
@@ -569,11 +578,46 @@ class SPRSacAgent(object):
         q2 = torch.stack(online_q2, 0)
         value_error = (q1 - returns).pow(2) + (q2 - returns).pow(2)
         value_loss = (weights[:, None, None] * value_error).mean()
-        if not with_actor:
-            return None, value_loss
+        rollout = {
+            "features": torch.stack(features, 0),
+            "noises": torch.stack(noises, 0),
+        }
+        return value_loss, rollout
+
+    def _imagination_actor_loss(self, rollout):
+        """One-step SAC actor loss on the actions already taken in the rollout."""
+        features = rollout["features"]
+        noises = rollout["noises"]
+        horizon = features.shape[0]
+        actor_terms = []
+        for index in range(horizon):
+            _, action, log_prob, _ = self.actor(features[index],
+                                                noise=noises[index])
+            actor_q1 = self.critic.Q1(features[index], action)
+            actor_q2 = self.critic.Q2(features[index], action)
+            actor_terms.append(self.alpha.detach() * log_prob -
+                               torch.min(actor_q1, actor_q2))
         actor_error = torch.stack(actor_terms, 0)
-        actor_loss = (weights[:, None, None] * actor_error).mean()
-        return actor_loss, value_loss
+        weights = self.discount**torch.arange(
+            horizon, device=features.device, dtype=features.dtype)
+        return (weights[:, None, None] * actor_error).mean()
+
+    def _imagination_losses(self, obs, with_actor):
+        """On-policy SAC losses inside a short latent rollout.
+
+        The actor term reuses the rollout action sequence. A critic-only
+        call stores that sequence; the following actor call rebuilds it
+        with the same noise so the updated Q scores those actions.
+        """
+        if with_actor and self._imag_rollout is not None:
+            rollout = self._imag_rollout
+            self._imag_rollout = None
+            return self._imagination_actor_loss(rollout), None
+        value_loss, rollout = self._imagination_rollout(obs)
+        if not with_actor:
+            self._imag_rollout = rollout
+            return None, value_loss
+        return self._imagination_actor_loss(rollout), value_loss
 
     def update_critic(self, obs, action, reward, next_obs, not_done, L, step,
                       imag_value_loss=None, imag_scale=0.0):
@@ -727,6 +771,7 @@ class SPRSacAgent(object):
             )
 
         self.grad_steps += 1
+        self._imag_rollout = None
         imag_scale = self._note_imagination_schedule(L, step)
         imagine = (imag_scale > 0.0 and self.encoder_type == 'pixel' and
                    self.jumps > 0)
@@ -743,8 +788,8 @@ class SPRSacAgent(object):
             self.update_spr(spr_kwargs, L, step)
 
         if step % self.actor_update_freq == 0:
-            # A fresh rollout. The critic step above updates Q in place, so
-            # the actor graph must be built after that step.
+            # The critic step above updates Q in place, so the actor graph is
+            # built after that step. It replays this update's rollout actions.
             imag_actor_loss = None
             if imagine:
                 imag_actor_loss, _ = self._imagination_losses(
@@ -752,6 +797,8 @@ class SPRSacAgent(object):
             self.update_actor_and_alpha(obs, L, step,
                                         imag_actor_loss=imag_actor_loss,
                                         imag_scale=imag_scale)
+        else:
+            self._imag_rollout = None
 
         if step % self.critic_target_update_freq == 0:
             utils.soft_update_params(self.critic.Q1, self.critic_target.Q1,
