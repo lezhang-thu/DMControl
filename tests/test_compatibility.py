@@ -23,7 +23,7 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
 from logger import Logger
-from spr_sac import SPR, SPRSacAgent
+from spr_sac import SPR, SPRSacAgent, lambda_returns
 from utils import FrameStack, ReplayBuffer, random_crop, random_crop_2
 
 
@@ -215,6 +215,117 @@ class AgentTests(NumericalTestCase):
         action = agent.sample_action(observation)
         self.assertEqual(action.shape, (2,))
         self.assertTrue(np.all(np.abs(action) <= 1.0))
+
+    def test_lambda_returns_match_one_step_and_monte_carlo(self):
+        rewards = torch.tensor([[[1.0]], [[3.0]]])
+        values = torch.tensor([[[0.0]], [[10.0]], [[4.0]]])
+        one_step = lambda_returns(rewards, values, discount=1.0, lam=0.0)
+        torch.testing.assert_close(one_step, torch.tensor([[[11.0]], [[7.0]]]))
+        monte_carlo = lambda_returns(rewards, values, discount=1.0, lam=1.0)
+        torch.testing.assert_close(monte_carlo, torch.tensor([[[8.0]], [[7.0]]]))
+
+    def test_imagination_gate_prints_start_and_full_strength(self):
+        agent = make_agent()
+        agent.imag_warmup = 2
+        buffer = make_buffer()
+        for _ in range(12):
+            observation = np.random.randint(0, 256, (9, 100, 100), dtype=np.uint8)
+            buffer.add(observation, np.random.uniform(-1, 1, 2).astype(np.float32),
+                       1.0, observation, False)
+        buffer.add_agent(agent)
+        logger = Logger(tempfile.mkdtemp())
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            for step in range(1, 5):
+                agent.update(buffer, logger, step)
+        text = output.getvalue()
+        self.assertIn("imaginary training starts at gradient step 3", text)
+        self.assertIn("imaginary training at full strength at gradient step 4", text)
+        self.assertEqual(text.count("imaginary training starts"), 1)
+        self.assertEqual(text.count("imaginary training at full strength"), 1)
+        self.assertEqual(agent._imag_scale(), 1.0)
+
+    def test_gradients_respect_the_detached_world_model(self):
+        agent = make_agent()
+        self.assertIs(agent.SPR.encoder, agent.critic.encoder)
+        self.assertFalse(hasattr(agent.actor, "encoder"))
+        buffer = make_buffer()
+        for _ in range(12):
+            observation = np.random.randint(0, 256, (9, 100, 100), dtype=np.uint8)
+            buffer.add(observation, np.random.uniform(-1, 1, 2).astype(np.float32),
+                       1.0, observation, False)
+        buffer.add_agent(agent)
+        obs, replay_action, reward, next_obs, not_done, spr_kwargs = buffer.sample_spr()
+        logger = Logger(tempfile.mkdtemp())
+
+        def clone(tensor):
+            return tensor.detach().clone()
+
+        encoder = agent.critic.encoder.fc.weight
+        projector = agent.SPR.global_classifier[0].weight
+        transition = agent.SPR.transition_model.fc.weight
+        reward_head = agent.SPR.reward_head[-1].weight
+        trunk = agent.actor.trunk[0].weight
+        q1 = agent.critic.Q1.trunk[0].weight
+        q2 = agent.critic.Q2.trunk[0].weight
+
+        before_encoder = clone(encoder)
+        before_projector = clone(projector)
+        before_transition = clone(transition)
+        before_trunk = clone(trunk)
+        agent.update_actor_and_alpha(obs, logger, 1)
+        self.assertFalse(torch.equal(trunk, before_trunk))
+        torch.testing.assert_close(encoder, before_encoder)
+        torch.testing.assert_close(projector, before_projector)
+        torch.testing.assert_close(transition, before_transition)
+
+        before_q1, before_q2 = clone(q1), clone(q2)
+        before_projector = clone(projector)
+        agent.update_critic(obs, replay_action, reward, next_obs, not_done, logger, 1)
+        self.assertFalse(torch.equal(q1, before_q1))
+        self.assertFalse(torch.equal(q2, before_q2))
+        self.assertFalse(torch.equal(projector, before_projector))
+
+        observation = spr_kwargs["observation"]
+        frame = agent.SPR.transform(observation[0].flatten(1, 2), augment=True)
+        latent = agent.SPR.encoder(frame)
+        latents = [latent]
+        for index in range(1, agent.jumps + 1):
+            latent = agent.SPR.transition_model.sample_prediction(
+                torch.cat([latent, spr_kwargs["action"][index - 1]], dim=1))
+            latents.append(latent)
+        agent.spr_optimizer.zero_grad()
+        agent._arrival_reward_loss(
+            latents, observation, spr_kwargs["reward"]).backward()
+        self.assertIsNotNone(reward_head.grad)
+        self.assertGreater(float(reward_head.grad.abs().sum()), 0.0)
+        self.assertIsNone(transition.grad)
+        self.assertIsNone(encoder.grad)
+
+        def clear_grads():
+            for parameter in (list(agent.SPR.parameters()) +
+                              list(agent.critic.parameters()) +
+                              list(agent.actor.parameters())):
+                parameter.grad = None
+
+        clear_grads()
+        _, value_loss = agent._imagination_losses(obs, with_actor=False)
+        value_loss.backward()
+        self.assertIsNotNone(q1.grad)
+        self.assertIsNotNone(projector.grad)
+        self.assertIsNone(encoder.grad)
+        self.assertIsNone(transition.grad)
+        self.assertIsNone(reward_head.grad)
+        self.assertIsNone(trunk.grad)
+
+        clear_grads()
+        actor_loss, _ = agent._imagination_losses(obs, with_actor=True)
+        actor_loss.backward()
+        self.assertIsNotNone(trunk.grad)
+        self.assertGreater(float(trunk.grad.abs().sum()), 0.0)
+        self.assertIsNone(encoder.grad)
+        self.assertIsNone(transition.grad)
+        self.assertIsNone(projector.grad)
+        self.assertIsNone(reward_head.grad)
 
 
 class PixelEnv(gym.Env):

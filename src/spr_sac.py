@@ -51,38 +51,41 @@ def weight_init(m):
         nn.init.orthogonal_(m.weight.data[:, :, mid, mid], gain)
 
 
-class Actor(nn.Module):
-    """MLP actor network."""
-    def __init__(self, obs_shape, action_shape, hidden_dim, encoder_type,
-                 encoder_feature_dim, log_std_min, log_std_max, num_layers,
-                 num_filters):
-        super().__init__()
+def lambda_returns(rewards, values, discount, lam):
+    """Lambda returns for imagined states 0..H-1.
 
-        self.encoder = make_encoder(encoder_type,
-                                    obs_shape,
-                                    encoder_feature_dim,
-                                    num_layers,
-                                    num_filters,
-                                    output_logits=True)
+    rewards: [H, B, 1] reward of the transition into the next state.
+    values: [H + 1, B, 1] soft values V(z_t) = min Q_target - alpha log pi.
+    Continuation is 1, so the only discount is `discount`.
+    """
+    live = rewards.new_tensor(float(discount))
+    mixed = rewards + live * (1.0 - lam) * values[1:]
+    returns = values[-1]
+    outputs = []
+    for index in range(rewards.shape[0] - 1, -1, -1):
+        returns = mixed[index] + live * lam * returns
+        outputs.append(returns)
+    return torch.stack(outputs[::-1], 0)
+
+
+class Actor(nn.Module):
+    """MLP actor. The shared encoder and SPR projection live outside this module."""
+    def __init__(self, action_shape, hidden_dim, feature_dim, log_std_min,
+                 log_std_max):
+        super().__init__()
 
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
 
         self.trunk = nn.Sequential(
-            nn.Linear(self.encoder.feature_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(feature_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, 2 * action_shape[0]))
 
         self.apply(weight_init)
 
-    def forward(self,
-                obs,
-                compute_pi=True,
-                compute_log_pi=True,
-                detach_encoder=False):
-        obs = self.encoder(obs, detach=detach_encoder)
-
-        mu, log_std = self.trunk(obs).chunk(2, dim=-1)
+    def forward(self, feature, compute_pi=True, compute_log_pi=True):
+        mu, log_std = self.trunk(feature).chunk(2, dim=-1)
 
         # constrain log_std inside [log_std_min, log_std_max]
         log_std = torch.tanh(log_std)
@@ -146,13 +149,14 @@ class Critic(nn.Module):
 
         self.apply(weight_init)
 
-    def forward(self, obs, action, detach_encoder=False):
+    def forward(self, obs, action, detach_encoder=False, projection=None):
         # detach_encoder allows to stop gradient propogation to encoder
         obs = self.encoder(obs, detach=detach_encoder)
+        if projection is not None:
+            obs = projection(obs)
 
         q1 = self.Q1(obs, action)
         q2 = self.Q2(obs, action)
-
 
         return q1, q2
 
@@ -240,9 +244,11 @@ class SPR(nn.Module):
             self.transforms.append(transformation)
             self.eval_transforms.append(eval_transformation)
 
-        self.reward_predictor = nn.Sequential(
+        self.reward_head = nn.Sequential(
             nn.Linear(encoder_feature_dim, 512), nn.LayerNorm(512), nn.ReLU(),
             nn.Linear(512, 1))
+        nn.init.zeros_(self.reward_head[-1].weight)
+        nn.init.zeros_(self.reward_head[-1].bias)
 
     def global_spr_loss(self, latents, target_latents, observation):
         global_latents = self.global_classifier(latents)  # proj
@@ -331,8 +337,12 @@ class SPRSacAgent(object):
             aug_prob=1.0,
             t0_spr_loss_weight=0.0,
             model_spr_weight=5.0,
-            reward_loss_weight=0.0,
+            reward_loss_weight=1.0,
             auxiliary_task_lr=1e-3,
+            imag_warmup=2000,
+            imag_actor_weight=0.1,
+            imag_value_weight=0.05,
+            imag_lambda=0.95,
             # sac
             hidden_dim=256,
             discount=0.99,
@@ -371,11 +381,11 @@ class SPRSacAgent(object):
         self.model_spr_weight = model_spr_weight
         self.t0_spr_loss_weight = t0_spr_loss_weight
         self.reward_loss_weight = reward_loss_weight
-
-        self.actor = Actor(obs_shape, action_shape, hidden_dim, encoder_type,
-                           encoder_feature_dim, actor_log_std_min,
-                           actor_log_std_max, num_layers,
-                           num_filters).to(device)
+        self.imag_warmup = int(imag_warmup)
+        self.imag_actor_weight = imag_actor_weight
+        self.imag_value_weight = imag_value_weight
+        self.imag_lambda = imag_lambda
+        self.grad_steps = 0
 
         self.critic = Critic(obs_shape, action_shape, hidden_dim, encoder_type,
                              encoder_feature_dim, num_layers,
@@ -387,27 +397,16 @@ class SPRSacAgent(object):
 
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-        # tie encoders between actor and critic
-        self.actor.encoder.copy_conv_weights_from(self.critic.encoder)
+        self.actor = Actor(action_shape, hidden_dim,
+                           self.critic.encoder.feature_dim, actor_log_std_min,
+                           actor_log_std_max).to(device)
 
         self.log_alpha = torch.tensor(np.log(init_temperature)).to(device)
         self.log_alpha.requires_grad = True
         # set target entropy to -|A|
         self.target_entropy = -np.prod(action_shape)
 
-        # optimizers
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(),
-                                                lr=actor_lr,
-                                                betas=(actor_beta, 0.999))
-
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(),
-                                                 lr=critic_lr,
-                                                 betas=(critic_beta, 0.999))
-
-        self.log_alpha_optimizer = torch.optim.Adam([self.log_alpha],
-                                                    lr=alpha_lr,
-                                                    betas=(alpha_beta, 0.999))
-
+        critic_parameters = list(self.critic.parameters())
         if self.encoder_type == 'pixel':
             # create SPR representation model
             self.SPR = SPR(action_shape,
@@ -423,11 +422,27 @@ class SPRSacAgent(object):
                            momentum_tau,
                            aug_prob,
                            output_type='continuous').to(self.device)
+            # The real critic loss trains the shared projection. The predictor
+            # and the transition stay on the SPR optimizer only.
+            critic_parameters += list(self.SPR.global_classifier.parameters())
             # optimizer for critic encoder and spr loss
             self.encoder_optimizer = torch.optim.Adam(
                 self.critic.encoder.parameters(), lr=2 * encoder_lr)
             self.spr_optimizer = torch.optim.Adam(self.SPR.parameters(),
                                                   lr=auxiliary_task_lr)
+
+        # The actor trunk is the only module the actor loss steps.
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(),
+                                                lr=actor_lr,
+                                                betas=(actor_beta, 0.999))
+
+        self.critic_optimizer = torch.optim.Adam(critic_parameters,
+                                                 lr=critic_lr,
+                                                 betas=(critic_beta, 0.999))
+
+        self.log_alpha_optimizer = torch.optim.Adam([self.log_alpha],
+                                                    lr=alpha_lr,
+                                                    betas=(alpha_beta, 0.999))
 
         self.train()
         self.critic_target.train()
@@ -443,13 +458,26 @@ class SPRSacAgent(object):
     def alpha(self):
         return self.log_alpha.exp()
 
+    def _project(self, latent, target=False):
+        if self.encoder_type != 'pixel':
+            return latent
+        projection = (self.SPR.global_target_classifier
+                      if target else self.SPR.global_classifier)
+        return projection(latent)
+
+    def _policy(self, obs, compute_pi=True, compute_log_pi=True):
+        latent = self._project(self.critic.encoder(obs))
+        return self.actor(latent,
+                          compute_pi=compute_pi,
+                          compute_log_pi=compute_log_pi)
+
     def select_action(self, obs):
         with torch.no_grad():
             obs = torch.FloatTensor(obs).to(self.device)
             obs = obs.unsqueeze(0)
-            mu, _, _, _ = self.actor(obs,
-                                     compute_pi=False,
-                                     compute_log_pi=False)
+            mu, _, _, _ = self._policy(obs,
+                                       compute_pi=False,
+                                       compute_log_pi=False)
             return mu.detach().cpu().numpy().flatten()
 
     def sample_action(self, obs):
@@ -459,22 +487,117 @@ class SPRSacAgent(object):
         with torch.no_grad():
             obs = torch.FloatTensor(obs).to(self.device)
             obs = obs.unsqueeze(0)
-            mu, pi, _, _ = self.actor(obs, compute_log_pi=False)
+            mu, pi, _, _ = self._policy(obs, compute_log_pi=False)
             return pi.detach().cpu().numpy().flatten()
 
-    def update_critic(self, obs, action, reward, next_obs, not_done, L, step):
+    def _imag_scale(self):
+        warmup = self.imag_warmup
+        if warmup <= 0:
+            return 1.0
+        if self.grad_steps <= warmup:
+            return 0.0
+        return float(min(1.0, (self.grad_steps - warmup) / float(warmup)))
+
+    def _note_imagination_schedule(self, logger, step):
+        scale = self._imag_scale()
+        if self.imag_warmup <= 0 and self.grad_steps == 1:
+            print("imaginary training starts at gradient step 1", flush=True)
+            print("imaginary training at full strength at gradient step 1",
+                  flush=True)
+        elif self.grad_steps == self.imag_warmup + 1:
+            print("imaginary training starts at gradient step "
+                  f"{self.grad_steps}",
+                  flush=True)
+        elif self.grad_steps == 2 * self.imag_warmup:
+            print("imaginary training at full strength at gradient step "
+                  f"{self.grad_steps}",
+                  flush=True)
+        if step % self.log_interval == 0:
+            logger.log('train/imag_scale', scale, step)
+        return scale
+
+    def _imagination_losses(self, obs, with_actor):
+        """On-policy SAC losses inside a short latent rollout.
+
+        Every latent is detached, so these losses do not train the encoder
+        or the transition. The reward readout is detached as well.
+        """
+        horizon = self.jumps
+        latent = self.critic.encoder(obs).detach()
+        rewards = []
+        values = []
+        online_q1 = []
+        online_q2 = []
+        actor_terms = []
+        for _ in range(horizon):
+            feature = self._project(latent)
+            _, action, log_prob, _ = self.actor(feature.detach())
+            nxt = self.SPR.transition_model.sample_prediction(
+                torch.cat([latent, action.detach()], dim=1)).detach()
+            rewards.append(self.SPR.reward_head(nxt).detach())
+            with torch.no_grad():
+                target_feature = self._project(latent, target=True)
+                target_q1 = self.critic_target.Q1(target_feature, action)
+                target_q2 = self.critic_target.Q2(target_feature, action)
+                values.append(
+                    torch.min(target_q1, target_q2) -
+                    self.alpha.detach() * log_prob)
+            online_q1.append(self.critic.Q1(feature, action.detach()))
+            online_q2.append(self.critic.Q2(feature, action.detach()))
+            if with_actor:
+                actor_q1 = self.critic.Q1(feature.detach(), action)
+                actor_q2 = self.critic.Q2(feature.detach(), action)
+                actor_terms.append(self.alpha.detach() * log_prob -
+                                   torch.min(actor_q1, actor_q2))
+            latent = nxt
         with torch.no_grad():
-            _, policy_action, log_pi, _ = self.actor(next_obs)
-            target_Q1, target_Q2 = self.critic_target(next_obs, policy_action)
+            _, final_action, final_log_prob, _ = self.actor(
+                self._project(latent).detach())
+            target_feature = self._project(latent, target=True)
+            target_q1 = self.critic_target.Q1(target_feature, final_action)
+            target_q2 = self.critic_target.Q2(target_feature, final_action)
+            values.append(
+                torch.min(target_q1, target_q2) -
+                self.alpha.detach() * final_log_prob)
+        rewards = torch.stack(rewards, 0)
+        values = torch.stack(values, 0)
+        returns = lambda_returns(rewards, values, self.discount,
+                                 self.imag_lambda).detach()
+        weights = self.discount**torch.arange(
+            horizon, device=obs.device, dtype=rewards.dtype)
+        q1 = torch.stack(online_q1, 0)
+        q2 = torch.stack(online_q2, 0)
+        value_error = (q1 - returns).pow(2) + (q2 - returns).pow(2)
+        value_loss = (weights[:, None, None] * value_error).mean()
+        if not with_actor:
+            return None, value_loss
+        actor_error = torch.stack(actor_terms, 0)
+        actor_loss = (weights[:, None, None] * actor_error).mean()
+        return actor_loss, value_loss
+
+    def update_critic(self, obs, action, reward, next_obs, not_done, L, step,
+                      imag_value_loss=None, imag_scale=0.0):
+        with torch.no_grad():
+            _, policy_action, log_pi, _ = self._policy(next_obs)
+            projection = (self.SPR.global_target_classifier
+                          if self.encoder_type == 'pixel' else None)
+            target_Q1, target_Q2 = self.critic_target(
+                next_obs, policy_action, projection=projection)
             target_V = torch.min(target_Q1,
                                  target_Q2) - self.alpha.detach() * log_pi
             target_Q = reward + (not_done * self.discount * target_V)
 
-        # get current Q estimates
+        # Replay action, projected shared encoder feature.
+        projection = (self.SPR.global_classifier
+                      if self.encoder_type == 'pixel' else None)
         current_Q1, current_Q2 = self.critic(
-            obs, action, detach_encoder=self.detach_encoder)
+            obs, action, detach_encoder=self.detach_encoder,
+            projection=projection)
         critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(
             current_Q2, target_Q)
+        if imag_value_loss is not None and imag_scale > 0.0:
+            critic_loss = critic_loss + (
+                self.imag_value_weight * imag_scale * imag_value_loss)
         if step % self.log_interval == 0:
             L.log('train_critic/loss', critic_loss, step)
 
@@ -484,13 +607,19 @@ class SPRSacAgent(object):
         self.critic_optimizer.step()
 
 
-    def update_actor_and_alpha(self, obs, L, step):
-        # detach encoder, so we don't update it with the actor loss
-        _, pi, log_pi, log_std = self.actor(obs, detach_encoder=True)
-        actor_Q1, actor_Q2 = self.critic(obs, pi, detach_encoder=True)
+    def update_actor_and_alpha(self, obs, L, step, imag_actor_loss=None,
+                               imag_scale=0.0):
+        # Detach the projected feature so the actor loss trains the trunk only.
+        feature = self._project(self.critic.encoder(obs)).detach()
+        _, pi, log_pi, log_std = self.actor(feature)
+        actor_Q1 = self.critic.Q1(feature, pi)
+        actor_Q2 = self.critic.Q2(feature, pi)
 
         actor_Q = torch.min(actor_Q1, actor_Q2)
         actor_loss = (self.alpha.detach() * log_pi - actor_Q).mean()
+        if imag_actor_loss is not None and imag_scale > 0.0:
+            actor_loss = actor_loss + (
+                self.imag_actor_weight * imag_scale * imag_actor_loss)
 
         if step % self.log_interval == 0:
             L.log('train_actor/loss', actor_loss, step)
@@ -523,7 +652,6 @@ class SPRSacAgent(object):
         # [1+self.jumps, 1]
         reward = spr_kwargs["reward"]
 
-        pred_reward = []
         pred_latents = []
 
         input_obs = observation[0].flatten(1, 2)
@@ -534,32 +662,15 @@ class SPRSacAgent(object):
         latent = self.SPR.encoder(input_obs.reshape(
             T * B, *img_shape))  # Fold if T dimension.
 
-        # spr loss
+        # Open-loop rollout with the replay actions.
         pred_latents.append(latent)
-        if self.jumps > 0:
-            pred_rew = self.SPR.reward_predictor(pred_latents[0])
-            pred_reward.append(F.log_softmax(pred_rew, -1))
+        for j in range(1, self.jumps + 1):
+            latent = self.SPR.transition_model.sample_prediction(
+                torch.cat([latent, action[j - 1]], dim=1))
+            pred_latents.append(latent)
 
-            for j in range(1, self.jumps + 1):
-                latent = self.SPR.transition_model.sample_prediction(
-                    torch.cat([latent, action[j - 1]], dim=1))
-                pred_rew = self.SPR.reward_predictor(
-                    latent)[:observation.shape[1]]
-                pred_latents.append(latent)
-                pred_reward.append(F.log_softmax(pred_rew, -1))
-
-        # pred_reward loss
-        if len(pred_reward) > 0:
-            pred_reward = torch.stack(pred_reward, 0)
-            with torch.no_grad():
-                reward_target = utils.to_categorical(
-                    reward[:self.jumps + 1].flatten().to(self.device),
-                    limit=0).reshape(*pred_reward.shape)
-            reward_loss = -torch.sum(reward_target * pred_reward,
-                                     2).mean(0).cpu()
-        else:
-            reward_loss = torch.zeros(observation.shape[1], )
-
+        reward_loss = self._arrival_reward_loss(pred_latents, observation,
+                                                reward)
         spr_loss = self.SPR.do_spr_loss(pred_latents, observation)
         if self.jumps > 0:
             model_spr_loss = spr_loss[1:].mean(0)  # (jumps, bs) => (bs, )
@@ -570,7 +681,7 @@ class SPRSacAgent(object):
 
         final_spr_loss = self.t0_spr_loss_weight * t0_spr_loss.mean() + \
             self.model_spr_weight * model_spr_loss.mean() + \
-            self.reward_loss_weight * reward_loss.mean().to(self.device)
+            self.reward_loss_weight * reward_loss
 
         self.encoder_optimizer.zero_grad()
         self.spr_optimizer.zero_grad()
@@ -580,6 +691,32 @@ class SPRSacAgent(object):
 
         if step % self.log_interval == 0:
             L.log('train/spr_loss', final_spr_loss, step)
+            L.log('train/reward_loss', reward_loss, step)
+
+    def _arrival_reward_loss(self, pred_latents, observation, reward):
+        """Detached readout: the latent of s_{k+1} predicts reward r_k."""
+        if self.jumps <= 0 or self.reward_loss_weight == 0.0:
+            return pred_latents[0].new_zeros(())
+        rollout = torch.stack(pred_latents[1:], 0).detach()
+        predicted_rollout = self.SPR.reward_head(
+            rollout.reshape(-1, rollout.shape[-1])).view(self.jumps, -1, 1)
+        real = self._real_arrival_features(observation)
+        predicted_real = self.SPR.reward_head(
+            real.reshape(-1, real.shape[-1])).view(self.jumps, -1, 1)
+        target = reward[:self.jumps]
+        if target.dim() == 2:
+            target = target.unsqueeze(-1)
+        return (F.mse_loss(predicted_rollout, target) +
+                F.mse_loss(predicted_real, target))
+
+    def _real_arrival_features(self, observation):
+        frames = observation[1:self.jumps + 1]
+        frames = frames.transpose(0, 1).flatten(2, 3)
+        frames = self.SPR.transform(frames, True)
+        with torch.no_grad():
+            latents = self.SPR.target_encoder(frames.flatten(0, 1))
+        batch = observation.shape[1]
+        return latents.view(batch, self.jumps, -1).transpose(0, 1)
 
     def update(self, replay_buffer, L, step):
         if self.encoder_type == 'pixel':
@@ -589,14 +726,32 @@ class SPRSacAgent(object):
             obs, action, reward, next_obs, not_done = replay_buffer.sample_proprio(
             )
 
+        self.grad_steps += 1
+        imag_scale = self._note_imagination_schedule(L, step)
+        imagine = (imag_scale > 0.0 and self.encoder_type == 'pixel' and
+                   self.jumps > 0)
+        imag_value_loss = None
+        if imagine:
+            _, imag_value_loss = self._imagination_losses(obs, with_actor=False)
+
         if step % self.log_interval == 0:
             L.log('train/batch_reward', reward.mean(), step)
-        self.update_critic(obs, action, reward, next_obs, not_done, L, step)
+        self.update_critic(obs, action, reward, next_obs, not_done, L, step,
+                           imag_value_loss=imag_value_loss,
+                           imag_scale=imag_scale)
         if self.encoder_type == 'pixel':
             self.update_spr(spr_kwargs, L, step)
 
         if step % self.actor_update_freq == 0:
-            self.update_actor_and_alpha(obs, L, step)
+            # A fresh rollout. The critic step above updates Q in place, so
+            # the actor graph must be built after that step.
+            imag_actor_loss = None
+            if imagine:
+                imag_actor_loss, _ = self._imagination_losses(
+                    obs, with_actor=True)
+            self.update_actor_and_alpha(obs, L, step,
+                                        imag_actor_loss=imag_actor_loss,
+                                        imag_scale=imag_scale)
 
         if step % self.critic_target_update_freq == 0:
             utils.soft_update_params(self.critic.Q1, self.critic_target.Q1,

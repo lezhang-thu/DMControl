@@ -51,7 +51,11 @@ time_offset: 0
 momentum_tau: 0.05
 aug_prob: 1.0
 fp_loss_weight: 1.0
-reward_loss_weight: 0.0
+reward_loss_weight: 1.0
+imag_warmup: 2000
+imag_actor_weight: 0.1
+imag_value_weight: 0.05
+imag_lambda: 0.95
 auxiliary_task_lr: 1e-3
 # misc
 seed: null
