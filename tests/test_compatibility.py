@@ -23,7 +23,7 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
 from logger import Logger
-from spr_sac import SPR, SPRSacAgent, lambda_returns
+from spr_sac import SPR, SPRSacAgent, lambda_returns, soft_lambda_returns
 from utils import FrameStack, ReplayBuffer, random_crop, random_crop_2
 
 
@@ -224,6 +224,23 @@ class AgentTests(NumericalTestCase):
         monte_carlo = lambda_returns(rewards, values, discount=1.0, lam=1.0)
         torch.testing.assert_close(monte_carlo, torch.tensor([[[8.0]], [[7.0]]]))
 
+    def test_soft_lambda_returns_price_later_actions_only(self):
+        rewards = torch.tensor([[[1.0]], [[3.0]]])
+        values = torch.tensor([[[0.0]], [[10.0]], [[4.0]]])
+        log_probs = torch.tensor([[[0.5]], [[0.25]]])
+        one_step = soft_lambda_returns(
+            rewards, values, log_probs, discount=1.0, lam=0.0, alpha=2.0)
+        torch.testing.assert_close(one_step, torch.tensor([[[11.0]], [[7.0]]]))
+        traced = soft_lambda_returns(
+            rewards, values, log_probs, discount=1.0, lam=1.0, alpha=2.0)
+        # G1 = r1 + V2; G0 = r0 + (G1 - alpha log pi(a1)).
+        torch.testing.assert_close(traced, torch.tensor([[[7.5]], [[7.0]]]))
+        silent = soft_lambda_returns(
+            rewards, values, torch.zeros_like(log_probs), discount=1.0,
+            lam=1.0, alpha=2.0)
+        torch.testing.assert_close(
+            silent, lambda_returns(rewards, values, discount=1.0, lam=1.0))
+
     def test_imagination_gate_prints_start_and_full_strength(self):
         agent = make_agent()
         agent.imag_warmup = 2
@@ -326,9 +343,17 @@ class AgentTests(NumericalTestCase):
         self.assertIsNone(transition.grad)
         self.assertIsNone(projector.grad)
         self.assertIsNone(reward_head.grad)
+        self.assertIsNone(q1.grad)
+        self.assertIsNone(q2.grad)
 
-    def test_imaginary_actor_reuses_rollout_actions(self):
+    def test_imaginary_actor_scores_stored_actions(self):
         agent = make_agent()
+        feature = torch.randn(4, agent.actor.trunk[0].in_features)
+        _, sampled, sampled_log_prob, _ = agent.actor(feature)
+        torch.testing.assert_close(
+            agent.actor.log_prob(feature, sampled.detach()),
+            sampled_log_prob.detach(), atol=1e-4, rtol=1e-4)
+
         buffer = make_buffer()
         for _ in range(12):
             observation = np.random.randint(0, 256, (9, 100, 100), dtype=np.uint8)
@@ -337,39 +362,23 @@ class AgentTests(NumericalTestCase):
         buffer.add_agent(agent)
         obs, _, _, _, _, _ = buffer.sample_spr()
         _, value_loss = agent._imagination_losses(obs, with_actor=False)
-        value_loss.backward()
-        agent.critic_optimizer.step()
+        self.assertIsNotNone(value_loss)
         rollout = agent._imag_rollout
+        stored = rollout["actions"].clone()
+        loss = agent._imagination_actor_loss(rollout)
         with torch.no_grad():
-            expected = [
-                agent.actor(rollout["features"][index],
-                            noise=rollout["noises"][index])[1]
-                for index in range(rollout["features"].shape[0])
-            ]
-        fresh = {"count": 0}
-        seen = []
-        original = agent.actor.forward
-
-        def wrapped(feature, compute_pi=True, compute_log_pi=True, noise=None):
-            if noise is None and compute_pi:
-                fresh["count"] += 1
-            mu, action, log_prob, log_std = original(
-                feature, compute_pi=compute_pi, compute_log_pi=compute_log_pi,
-                noise=noise)
-            if noise is not None:
-                seen.append(action.detach())
-            return mu, action, log_prob, log_std
-
-        agent.actor.forward = wrapped
-        actor_loss, reused_value_loss = agent._imagination_losses(
-            obs, with_actor=True)
-        self.assertIsNone(reused_value_loss)
-        self.assertEqual(fresh["count"], 0)
-        self.assertEqual(len(seen), len(expected))
-        for action, target in zip(seen, expected):
-            torch.testing.assert_close(action, target)
-        actor_loss.backward()
+            agent.critic.Q1.trunk[-1].weight.add_(1.0)
+        unchanged = agent._imagination_actor_loss(rollout)
+        torch.testing.assert_close(loss.detach(), unchanged.detach())
+        rollout["actions"] = torch.zeros_like(stored)
+        rescored = agent._imagination_actor_loss(rollout)
+        self.assertGreater(float((rescored.detach() - loss.detach()).abs()), 1e-6)
+        agent.actor.zero_grad()
+        agent.critic.zero_grad()
+        loss.backward()
         self.assertIsNotNone(agent.actor.trunk[0].weight.grad)
+        self.assertIsNone(agent.critic.Q1.trunk[0].weight.grad)
+        self.assertIsNone(agent.critic.Q2.trunk[0].weight.grad)
 
 
 class PixelEnv(gym.Env):

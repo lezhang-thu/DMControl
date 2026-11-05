@@ -68,6 +68,44 @@ def lambda_returns(rewards, values, discount, lam):
     return torch.stack(outputs[::-1], 0)
 
 
+def soft_lambda_returns(rewards, values, log_probs, discount, lam, alpha):
+    """Soft lambda returns estimating Q(z_t, a_t) for imagined states 0..H-1.
+
+    The current action's entropy is not inside this return. On a lambda trace,
+    each later action pays the SAC temperature once:
+
+    G_{H-1} = r_{H-1} + discount * V_H
+    G_t = r_t + discount * (1 - lam) * V_{t+1}
+          + discount * lam * (G_{t+1} - alpha log pi(a_{t+1}))
+
+    rewards: [H, B, 1]. values: [H + 1, B, 1]. log_probs: [H, B, 1].
+    """
+    live = rewards.new_tensor(float(discount))
+    if torch.is_tensor(alpha):
+        temperature = alpha.detach().to(dtype=rewards.dtype, device=rewards.device)
+    else:
+        temperature = rewards.new_tensor(float(alpha))
+    returns = rewards[-1] + live * values[-1]
+    outputs = [returns]
+    for index in range(rewards.shape[0] - 2, -1, -1):
+        continuation = returns - temperature * log_probs[index + 1]
+        returns = (rewards[index] + live * (1.0 - lam) * values[index + 1] +
+                   live * lam * continuation)
+        outputs.append(returns)
+    return torch.stack(outputs[::-1], 0)
+
+
+def squashed_action_logprob(mu, log_std, action):
+    """Log density of a stored tanh-Gaussian action. `action` is constant."""
+    eps = 1e-6
+    clipped = action.clamp(-1.0 + eps, 1.0 - eps)
+    unsquashed = 0.5 * torch.log((1.0 + clipped) / (1.0 - clipped))
+    noise = (unsquashed - mu) / log_std.exp()
+    log_pi = gaussian_logprob(noise, log_std)
+    correction = torch.log(F.relu(1.0 - clipped.pow(2)) + eps).sum(-1, keepdim=True)
+    return log_pi - correction
+
+
 class Actor(nn.Module):
     """MLP actor. The shared encoder and SPR projection live outside this module."""
     def __init__(self, action_shape, hidden_dim, feature_dim, log_std_min,
@@ -84,19 +122,24 @@ class Actor(nn.Module):
 
         self.apply(weight_init)
 
-    def forward(self, feature, compute_pi=True, compute_log_pi=True, noise=None):
+    def _gaussian_params(self, feature):
         mu, log_std = self.trunk(feature).chunk(2, dim=-1)
-
-        # constrain log_std inside [log_std_min, log_std_max]
         log_std = torch.tanh(log_std)
         log_std = self.log_std_min + 0.5 * (self.log_std_max -
                                             self.log_std_min) * (log_std + 1)
+        return mu, log_std
 
+    def log_prob(self, feature, action):
+        """Score a stored squashed action. The gradient enters the trunk only."""
+        mu, log_std = self._gaussian_params(feature)
+        return squashed_action_logprob(mu, log_std, action.detach())
+
+    def forward(self, feature, compute_pi=True, compute_log_pi=True):
+        mu, log_std = self._gaussian_params(feature)
 
         if compute_pi:
             std = log_std.exp()
-            if noise is None:
-                noise = torch.randn_like(mu)
+            noise = torch.randn_like(mu)
             pi = mu + noise * std
         else:
             pi = None
@@ -523,27 +566,26 @@ class SPRSacAgent(object):
 
         Every latent is detached, so these losses do not train the encoder
         or the transition. The reward readout is detached as well. The
-        stored features and noises reproduce the rollout actions later,
-        after the critic step has updated Q.
+        stored actions are the samples the score-function actor updates.
         """
         horizon = self.jumps
         latent = self.critic.encoder(obs).detach()
-        action_dim = self.actor.trunk[-1].out_features // 2
         rewards = []
         values = []
         online_q1 = []
         online_q2 = []
         features = []
-        noises = []
+        actions = []
+        log_probs = []
+        baselines = []
         for _ in range(horizon):
             feature = self._project(latent)
             actor_feature = feature.detach()
-            noise = torch.randn(actor_feature.shape[0], action_dim,
-                                device=actor_feature.device,
-                                dtype=actor_feature.dtype)
-            _, action, log_prob, _ = self.actor(actor_feature, noise=noise)
+            mu, action, log_prob, log_std = self.actor(actor_feature)
             action = action.detach()
             log_prob = log_prob.detach()
+            mu = mu.detach()
+            log_std = log_std.detach()
             nxt = self.SPR.transition_model.sample_prediction(
                 torch.cat([latent, action], dim=1)).detach()
             rewards.append(self.SPR.reward_head(nxt).detach())
@@ -554,10 +596,19 @@ class SPRSacAgent(object):
                 values.append(
                     torch.min(target_q1, target_q2) -
                     self.alpha.detach() * log_prob)
+                mean_log_pi = gaussian_logprob(torch.zeros_like(log_std), log_std)
+                mean_log_pi = mean_log_pi - torch.log(
+                    F.relu(1 - mu.pow(2)) + 1e-6).sum(-1, keepdim=True)
+                baseline_q1 = self.critic_target.Q1(target_feature, mu)
+                baseline_q2 = self.critic_target.Q2(target_feature, mu)
+                baselines.append(
+                    torch.min(baseline_q1, baseline_q2) -
+                    self.alpha.detach() * mean_log_pi)
             online_q1.append(self.critic.Q1(feature, action))
             online_q2.append(self.critic.Q2(feature, action))
             features.append(actor_feature)
-            noises.append(noise)
+            actions.append(action)
+            log_probs.append(log_prob)
             latent = nxt
         with torch.no_grad():
             _, final_action, final_log_prob, _ = self.actor(
@@ -570,8 +621,9 @@ class SPRSacAgent(object):
                 self.alpha.detach() * final_log_prob)
         rewards = torch.stack(rewards, 0)
         values = torch.stack(values, 0)
-        returns = lambda_returns(rewards, values, self.discount,
-                                 self.imag_lambda).detach()
+        log_probs = torch.stack(log_probs, 0)
+        returns = soft_lambda_returns(rewards, values, log_probs, self.discount,
+                                      self.imag_lambda, self.alpha).detach()
         weights = self.discount**torch.arange(
             horizon, device=obs.device, dtype=rewards.dtype)
         q1 = torch.stack(online_q1, 0)
@@ -580,34 +632,42 @@ class SPRSacAgent(object):
         value_loss = (weights[:, None, None] * value_error).mean()
         rollout = {
             "features": torch.stack(features, 0),
-            "noises": torch.stack(noises, 0),
+            "actions": torch.stack(actions, 0),
+            "log_probs": log_probs,
+            "baselines": torch.stack(baselines, 0),
+            "returns": returns,
         }
         return value_loss, rollout
 
     def _imagination_actor_loss(self, rollout):
-        """One-step SAC actor loss on the actions already taken in the rollout."""
+        """Soft score-function loss on the stored rollout actions.
+
+        The advantage is G_t - alpha log pi(a_t) - V(z_t). G estimates the
+        soft action value, so this is the SAC actor target. The gradient
+        flows only through log pi of the stored action.
+        """
         features = rollout["features"]
-        noises = rollout["noises"]
+        actions = rollout["actions"]
         horizon = features.shape[0]
+        temperature = self.alpha.detach()
         actor_terms = []
         for index in range(horizon):
-            _, action, log_prob, _ = self.actor(features[index],
-                                                noise=noises[index])
-            actor_q1 = self.critic.Q1(features[index], action)
-            actor_q2 = self.critic.Q2(features[index], action)
-            actor_terms.append(self.alpha.detach() * log_prob -
-                               torch.min(actor_q1, actor_q2))
+            log_pi = self.actor.log_prob(features[index], actions[index])
+            advantage = (rollout["returns"][index] -
+                         temperature * rollout["log_probs"][index] -
+                         rollout["baselines"][index]).detach()
+            actor_terms.append(-log_pi * advantage)
         actor_error = torch.stack(actor_terms, 0)
         weights = self.discount**torch.arange(
             horizon, device=features.device, dtype=features.dtype)
         return (weights[:, None, None] * actor_error).mean()
 
     def _imagination_losses(self, obs, with_actor):
-        """On-policy SAC losses inside a short latent rollout.
+        """Imagination losses for one latent rollout.
 
-        The actor term reuses the rollout action sequence. A critic-only
-        call stores that sequence; the following actor call rebuilds it
-        with the same noise so the updated Q scores those actions.
+        The critic regresses Q to the soft lambda return. The actor scores
+        the actions stored from that rollout; a critic-only call keeps them
+        for the following actor call.
         """
         if with_actor and self._imag_rollout is not None:
             rollout = self._imag_rollout
@@ -788,8 +848,7 @@ class SPRSacAgent(object):
             self.update_spr(spr_kwargs, L, step)
 
         if step % self.actor_update_freq == 0:
-            # The critic step above updates Q in place, so the actor graph is
-            # built after that step. It replays this update's rollout actions.
+            # Score this update's stored rollout actions after the critic step.
             imag_actor_loss = None
             if imagine:
                 imag_actor_loss, _ = self._imagination_losses(
