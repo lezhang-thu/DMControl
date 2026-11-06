@@ -9,13 +9,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from kornia.augmentation import (CenterCrop, RandomAffine, RandomCrop,
-                                 RandomResizedCrop)
-from kornia.filters import GaussianBlur2d
+from kornia.augmentation import RandomCrop
 
 import utils
-from encoder import make_encoder
-from transition_model import make_transition_model
+from encoder import PixelEncoder
+from transition_model import DeterministicTransitionModel
 
 
 def gaussian_logprob(noise, log_std):
@@ -41,7 +39,7 @@ def weight_init(m):
     if isinstance(m, nn.Linear):
         nn.init.orthogonal_(m.weight.data)
         m.bias.data.fill_(0.0)
-    elif isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
+    elif isinstance(m, nn.Conv2d):
         # delta-orthogonal init from https://arxiv.org/pdf/1806.05393.pdf
         assert m.weight.size(2) == m.weight.size(3)
         m.weight.data.fill_(0.0)
@@ -53,17 +51,12 @@ def weight_init(m):
 
 class Actor(nn.Module):
     """MLP actor network."""
-    def __init__(self, obs_shape, action_shape, hidden_dim, encoder_type,
+    def __init__(self, obs_shape, action_shape, hidden_dim,
                  encoder_feature_dim, log_std_min, log_std_max, num_layers,
                  num_filters):
         super().__init__()
 
-        self.encoder = make_encoder(encoder_type,
-                                    obs_shape,
-                                    encoder_feature_dim,
-                                    num_layers,
-                                    num_filters,
-                                    output_logits=True)
+        self.encoder = PixelEncoder(obs_shape, encoder_feature_dim, num_layers, num_filters)
 
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
@@ -96,7 +89,6 @@ class Actor(nn.Module):
             pi = mu + noise * std
         else:
             pi = None
-            entropy = None
 
         if compute_log_pi:
             log_pi = gaussian_logprob(noise, log_std)
@@ -128,16 +120,11 @@ class QFunction(nn.Module):
 
 class Critic(nn.Module):
     """Critic network, employes two q-functions."""
-    def __init__(self, obs_shape, action_shape, hidden_dim, encoder_type,
+    def __init__(self, obs_shape, action_shape, hidden_dim,
                  encoder_feature_dim, num_layers, num_filters):
         super().__init__()
 
-        self.encoder = make_encoder(encoder_type,
-                                    obs_shape,
-                                    encoder_feature_dim,
-                                    num_layers,
-                                    num_filters,
-                                    output_logits=True)
+        self.encoder = PixelEncoder(obs_shape, encoder_feature_dim, num_layers, num_filters)
 
         self.Q1 = QFunction(self.encoder.feature_dim, action_shape[0],
                             hidden_dim)
@@ -158,41 +145,21 @@ class Critic(nn.Module):
 
 
 
-class Intensity(nn.Module):
-    def __init__(self, scale):
-        super().__init__()
-        self.scale = scale
-
-    def forward(self, x):
-        r = torch.randn((x.size(0), 1, 1, 1), device=x.device)
-        noise = 1.0 + (self.scale * r.clamp(-2.0, 2.0))
-        return x * noise
-
-
 class SPR(nn.Module):
-    """Some Information about SPR"""
+    """Predict future image representations with a latent transition model."""
     def __init__(self,
                  action_shape,
                  critic,
-                 critic_target,
-                 augmentation,
-                 transition_model_type='probabilistic',
                  transition_model_layer_width=512,
                  encoder_feature_dim=50,
                  jumps=5,
                  latent_dim=512,
-                 time_offset=0,
-                 momentum_tau=1.0,
-                 aug_prob=1.0,
-                 output_type="continuous"):
+                 momentum_tau=1.0):
         super(SPR, self).__init__()
         self.jumps = jumps
-        self.time_offset = time_offset
         self.momentum_tau = momentum_tau
-        self.aug_prob = aug_prob
-        self.transition_model = make_transition_model(
-            transition_model_type, encoder_feature_dim, action_shape,
-            transition_model_layer_width)
+        self.transition_model = DeterministicTransitionModel(
+            encoder_feature_dim, action_shape, transition_model_layer_width)
         self.encoder = critic.encoder
         self.target_encoder = copy.deepcopy(critic.encoder)
         self.global_classifier = nn.Sequential(
@@ -204,113 +171,40 @@ class SPR(nn.Module):
         self.global_final_classifier = nn.Sequential(
             nn.Linear(encoder_feature_dim, latent_dim), nn.ReLU(),
             nn.Linear(latent_dim, encoder_feature_dim))
-        self.transforms = nn.ModuleList()
-        self.eval_transforms = nn.ModuleList()
-        self.uses_augmentation = True
-        for aug in augmentation:
-            if aug == "affine":
-                transformation = RandomAffine(degrees=5, translate=(.14, .14),
-                                              scale=(.9, 1.1), shear=(-5, 5), p=0.5)
-                eval_transformation = nn.Identity()
-                self.uses_augmentation = True
-            elif aug == "crop":
-                transformation = RandomCrop(size=(84, 84), p=1.0, cropping_mode="slice")
-                eval_transformation = CenterCrop(size=(84, 84), p=1.0, cropping_mode="slice")
-                self.uses_augmentation = True
-            elif aug == "rrc":
-                transformation = RandomResizedCrop(size=(84, 84), scale=(0.8, 1.0),
-                                                   p=1.0, cropping_mode="resample")
-                eval_transformation = CenterCrop(size=(84, 84), p=1.0)
-                self.uses_augmentation = True
-            elif aug == "blur":
-                transformation = GaussianBlur2d((5, 5), (1.5, 1.5))
-                eval_transformation = nn.Identity()
-                self.uses_augmentation = True
-            elif aug == "shift":
-                transformation = nn.Sequential(nn.ReplicationPad2d(4),
-                                               RandomCrop(size=(84, 84), p=1.0, cropping_mode="slice"))
-                eval_transformation = CenterCrop(size=(84, 84), p=1.0)
-            elif aug == "intensity":
-                transformation = Intensity(scale=0.05)
-                eval_transformation = nn.Identity()
-            elif aug == "none":
-                transformation = eval_transformation = nn.Identity()
-            else:
-                raise NotImplementedError()
-            self.transforms.append(transformation)
-            self.eval_transforms.append(eval_transformation)
+        self.crop = RandomCrop(
+            size=self.encoder.obs_shape[-2:], p=1.0, cropping_mode="slice")
 
-        self.reward_predictor = nn.Sequential(
-            nn.Linear(encoder_feature_dim, 512), nn.LayerNorm(512), nn.ReLU(),
-            nn.Linear(512, 1))
-
-    def global_spr_loss(self, latents, target_latents, observation):
+    def global_spr_loss(self, latents, target_latents):
         global_latents = self.global_classifier(latents)  # proj
         global_latents = self.global_final_classifier(global_latents)  # pred
         with torch.no_grad():
             global_targets = self.global_target_classifier(target_latents)
-        targets = global_targets.reshape(-1, observation.shape[1], self.jumps + 1,
-                                      global_targets.shape[-1]).transpose(
-                                          1, 2)
-        latents = global_latents.reshape(-1, observation.shape[1], self.jumps + 1,
-                                      global_latents.shape[-1]).transpose(
-                                          1, 2)
-        loss = self.spr_loss(latents, targets)
-        return loss
+        return self.spr_loss(global_latents, global_targets)
 
     def spr_loss(self, f_x1s, f_x2s):
         f_x1 = F.normalize(f_x1s.float(), p=2., dim=-1, eps=1e-3)
         f_x2 = F.normalize(f_x2s.float(), p=2., dim=-1, eps=1e-3)
-        loss = F.mse_loss(f_x1, f_x2, reduction="none").sum(-1).mean(0)
-        return loss
-
-    def apply_transforms(self, transforms, eval_transforms, image):
-        if eval_transforms is None:
-            for transform in transforms:
-                image = transform(image)
-        else:
-            for transform, eval_transform in zip(transforms, eval_transforms):
-                image = utils.maybe_transform(image,
-                                              transform,
-                                              eval_transform,
-                                              p=self.aug_prob)
-        return image
+        return F.mse_loss(f_x1, f_x2, reduction="none").sum(-1).mean()
 
     @torch.no_grad()
-    def transform(self, images, augment=False):
-        # PixelEncoder normalizes 0..255 observations; preserve that scale.
-        images = images.float()
-        flat_images = images.reshape(-1, *images.shape[-3:])
-        if augment:
-            processed_images = self.apply_transforms(self.transforms,
-                                                     self.eval_transforms,
-                                                     flat_images)
-        else:
-            processed_images = self.apply_transforms(self.eval_transforms,
-                                                     None, flat_images)
-        processed_images = processed_images.reshape(*images.shape[:-3],
-                                                 *processed_images.shape[1:])
-        return processed_images
+    def augment(self, images):
+        # PixelEncoder normalizes observations; keep their 0..255 scale here.
+        flat_images = images.float().reshape(-1, *images.shape[-3:])
+        cropped = self.crop(flat_images)
+        noise = torch.randn((cropped.size(0), 1, 1, 1), device=cropped.device)
+        augmented = cropped * (1.0 + 0.05 * noise.clamp(-2.0, 2.0))
+        return augmented.reshape(*images.shape[:-3], *augmented.shape[1:])
 
     def do_spr_loss(self, pred_latents, observation):
-        pred_latents = torch.stack(pred_latents, 1)
-        latents = pred_latents[:observation.shape[1]].flatten(
-            0, 1)  # batch*jumps, *
-        neg_latents = pred_latents[observation.shape[1]:].flatten(0, 1)
-        latents = torch.cat([latents, neg_latents], 0)
-        target_images = observation[self.time_offset:self.jumps +
-                                    self.time_offset + 1]
+        latents = torch.stack(pred_latents, dim=1).flatten(0, 1)
+        target_images = observation[1:self.jumps + 1]
         target_images = target_images.transpose(0, 1).flatten(2, 3)
-        target_images = self.transform(target_images, True)  # Augment
+        target_images = self.augment(target_images)
 
         with torch.no_grad():
             target_latents = self.target_encoder(target_images.flatten(0, 1))
 
-        global_loss = self.global_spr_loss(latents, target_latents,
-                                           observation)
-        # split to batch, jumps
-        spr_loss = global_loss.reshape(-1, observation.shape[1])
-        return spr_loss
+        return self.global_spr_loss(latents, target_latents)
 
 
 class SPRSacAgent(object):
@@ -321,17 +215,11 @@ class SPRSacAgent(object):
             action_shape,
             device,
             # from spr
-            augmentation=(),
-            transition_model_type='probabilistic',
             transition_model_layer_width=512,
             jumps=5,
             latent_dim=512,
-            time_offset=0,
             momentum_tau=1.0,
-            aug_prob=1.0,
-            t0_spr_loss_weight=0.0,
             model_spr_weight=5.0,
-            reward_loss_weight=0.0,
             auxiliary_task_lr=1e-3,
             # sac
             hidden_dim=256,
@@ -348,14 +236,12 @@ class SPRSacAgent(object):
             critic_beta=0.9,
             critic_tau=0.005,
             critic_target_update_freq=2,
-            encoder_type='pixel',
             encoder_feature_dim=50,
             encoder_lr=1e-3,
             encoder_tau=0.005,
             num_layers=4,
             num_filters=32,
-            log_interval=100,
-            detach_encoder=False):
+            log_interval=100):
         self.device = device
         self.discount = discount
         self.critic_tau = critic_tau
@@ -364,25 +250,21 @@ class SPRSacAgent(object):
         self.critic_target_update_freq = critic_target_update_freq
         self.log_interval = log_interval
         self.image_size = obs_shape[-1]
-        self.detach_encoder = detach_encoder
-        self.encoder_type = encoder_type
 
         self.jumps = jumps
         self.model_spr_weight = model_spr_weight
-        self.t0_spr_loss_weight = t0_spr_loss_weight
-        self.reward_loss_weight = reward_loss_weight
 
-        self.actor = Actor(obs_shape, action_shape, hidden_dim, encoder_type,
+        self.actor = Actor(obs_shape, action_shape, hidden_dim,
                            encoder_feature_dim, actor_log_std_min,
                            actor_log_std_max, num_layers,
                            num_filters).to(device)
 
-        self.critic = Critic(obs_shape, action_shape, hidden_dim, encoder_type,
+        self.critic = Critic(obs_shape, action_shape, hidden_dim,
                              encoder_feature_dim, num_layers,
                              num_filters).to(device)
 
         self.critic_target = Critic(obs_shape, action_shape, hidden_dim,
-                                    encoder_type, encoder_feature_dim,
+                                    encoder_feature_dim,
                                     num_layers, num_filters).to(device)
 
         self.critic_target.load_state_dict(self.critic.state_dict())
@@ -408,26 +290,15 @@ class SPRSacAgent(object):
                                                     lr=alpha_lr,
                                                     betas=(alpha_beta, 0.999))
 
-        if self.encoder_type == 'pixel':
-            # create SPR representation model
-            self.SPR = SPR(action_shape,
-                           self.critic,
-                           self.critic_target,
-                           augmentation,
-                           transition_model_type,
-                           transition_model_layer_width,
-                           encoder_feature_dim,
-                           jumps,
-                           latent_dim,
-                           time_offset,
-                           momentum_tau,
-                           aug_prob,
-                           output_type='continuous').to(self.device)
-            # optimizer for critic encoder and spr loss
-            self.encoder_optimizer = torch.optim.Adam(
-                self.critic.encoder.parameters(), lr=2 * encoder_lr)
-            self.spr_optimizer = torch.optim.Adam(self.SPR.parameters(),
-                                                  lr=auxiliary_task_lr)
+        self.SPR = SPR(
+            action_shape, self.critic,
+            transition_model_layer_width=transition_model_layer_width,
+            encoder_feature_dim=encoder_feature_dim, jumps=jumps,
+            latent_dim=latent_dim, momentum_tau=momentum_tau,
+        ).to(self.device)
+        self.encoder_optimizer = torch.optim.Adam(
+            self.critic.encoder.parameters(), lr=2 * encoder_lr)
+        self.spr_optimizer = torch.optim.Adam(self.SPR.parameters(), lr=auxiliary_task_lr)
 
         self.train()
         self.critic_target.train()
@@ -436,8 +307,7 @@ class SPRSacAgent(object):
         self.training = training
         self.actor.train(training)
         self.critic.train(training)
-        if self.encoder_type == 'pixel':
-            self.SPR.train(training)
+        self.SPR.train(training)
 
     @property
     def alpha(self):
@@ -453,7 +323,7 @@ class SPRSacAgent(object):
             return mu.detach().cpu().numpy().flatten()
 
     def sample_action(self, obs):
-        if self.encoder_type == 'pixel' and obs.shape[-1] != self.image_size:
+        if obs.shape[-1] != self.image_size:
             obs = utils.center_crop_image(obs, self.image_size)
 
         with torch.no_grad():
@@ -471,8 +341,7 @@ class SPRSacAgent(object):
             target_Q = reward + (not_done * self.discount * target_V)
 
         # get current Q estimates
-        current_Q1, current_Q2 = self.critic(
-            obs, action, detach_encoder=self.detach_encoder)
+        current_Q1, current_Q2 = self.critic(obs, action)
         critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(
             current_Q2, target_Q)
         if step % self.log_interval == 0:
@@ -516,84 +385,45 @@ class SPRSacAgent(object):
         self.log_alpha_optimizer.step()
 
     def update_spr(self, spr_kwargs, L, step):
+        if self.jumps == 0:
+            if step % self.log_interval == 0:
+                L.log('train/spr_loss', 0.0, step)
+            return
+
         # [1+self.jumps, B, 9, 1, 84, 84]
         observation = spr_kwargs["observation"]
         # [1+self.jumps, B, dim_A]
         action = spr_kwargs["action"]
-        # [1+self.jumps, 1]
-        reward = spr_kwargs["reward"]
-
-        pred_reward = []
-        pred_latents = []
 
         input_obs = observation[0].flatten(1, 2)
-        input_obs = self.SPR.transform(input_obs, augment=True)
+        input_obs = self.SPR.augment(input_obs)
+        latent = self.SPR.encoder(input_obs)
 
-        # stem forward
-        lead_dim, T, B, img_shape = utils.infer_leading_dims(input_obs, 3)
-        latent = self.SPR.encoder(input_obs.reshape(
-            T * B, *img_shape))  # Fold if T dimension.
+        pred_latents = []
+        for step_action in action[:self.jumps]:
+            latent = self.SPR.transition_model(
+                torch.cat([latent, step_action], dim=1))
+            pred_latents.append(latent)
 
-        # spr loss
-        pred_latents.append(latent)
-        if self.jumps > 0:
-            pred_rew = self.SPR.reward_predictor(pred_latents[0])
-            pred_reward.append(F.log_softmax(pred_rew, -1))
-
-            for j in range(1, self.jumps + 1):
-                latent = self.SPR.transition_model.sample_prediction(
-                    torch.cat([latent, action[j - 1]], dim=1))
-                pred_rew = self.SPR.reward_predictor(
-                    latent)[:observation.shape[1]]
-                pred_latents.append(latent)
-                pred_reward.append(F.log_softmax(pred_rew, -1))
-
-        # pred_reward loss
-        if len(pred_reward) > 0:
-            pred_reward = torch.stack(pred_reward, 0)
-            with torch.no_grad():
-                reward_target = utils.to_categorical(
-                    reward[:self.jumps + 1].flatten().to(self.device),
-                    limit=0).reshape(*pred_reward.shape)
-            reward_loss = -torch.sum(reward_target * pred_reward,
-                                     2).mean(0).cpu()
-        else:
-            reward_loss = torch.zeros(observation.shape[1], )
-
-        spr_loss = self.SPR.do_spr_loss(pred_latents, observation)
-        if self.jumps > 0:
-            model_spr_loss = spr_loss[1:].mean(0)  # (jumps, bs) => (bs, )
-            t0_spr_loss = spr_loss[0]
-        else:
-            t0_spr_loss = spr_loss[0]
-            model_spr_loss = torch.zeros_like(spr_loss)
-
-        final_spr_loss = self.t0_spr_loss_weight * t0_spr_loss.mean() + \
-            self.model_spr_weight * model_spr_loss.mean() + \
-            self.reward_loss_weight * reward_loss.mean().to(self.device)
+        spr_loss = self.model_spr_weight * self.SPR.do_spr_loss(
+            pred_latents, observation)
 
         self.encoder_optimizer.zero_grad()
         self.spr_optimizer.zero_grad()
-        final_spr_loss.backward()
+        spr_loss.backward()
         self.encoder_optimizer.step()
         self.spr_optimizer.step()
 
         if step % self.log_interval == 0:
-            L.log('train/spr_loss', final_spr_loss, step)
+            L.log('train/spr_loss', spr_loss, step)
 
     def update(self, replay_buffer, L, step):
-        if self.encoder_type == 'pixel':
-            obs, action, reward, next_obs, not_done, spr_kwargs = replay_buffer.sample_spr(
-            )
-        else:
-            obs, action, reward, next_obs, not_done = replay_buffer.sample_proprio(
-            )
+        obs, action, reward, next_obs, not_done, spr_kwargs = replay_buffer.sample_spr()
 
         if step % self.log_interval == 0:
             L.log('train/batch_reward', reward.mean(), step)
         self.update_critic(obs, action, reward, next_obs, not_done, L, step)
-        if self.encoder_type == 'pixel':
-            self.update_spr(spr_kwargs, L, step)
+        self.update_spr(spr_kwargs, L, step)
 
         if step % self.actor_update_freq == 0:
             self.update_actor_and_alpha(obs, L, step)
@@ -606,9 +436,8 @@ class SPRSacAgent(object):
             utils.soft_update_params(self.critic.encoder,
                                      self.critic_target.encoder,
                                      self.encoder_tau)
-            if self.encoder_type == 'pixel':
-                utils.soft_update_params(self.SPR.encoder, self.SPR.target_encoder,
-                                         self.SPR.momentum_tau)
-                utils.soft_update_params(self.SPR.global_classifier,
-                                         self.SPR.global_target_classifier,
-                                         self.SPR.momentum_tau)
+            utils.soft_update_params(self.SPR.encoder, self.SPR.target_encoder,
+                                     self.SPR.momentum_tau)
+            utils.soft_update_params(self.SPR.global_classifier,
+                                     self.SPR.global_target_classifier,
+                                     self.SPR.momentum_tau)

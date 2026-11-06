@@ -10,34 +10,29 @@ import json
 from pathlib import Path
 import sys
 import tempfile
-from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 import gymnasium as gym
 import numpy as np
 import torch
-from torch import nn
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
 from logger import Logger
-from spr_sac import SPR, SPRSacAgent
-from utils import FrameStack, ReplayBuffer, random_crop, random_crop_2
+from spr_sac import SPRSacAgent
+from utils import FrameStack, ReplayBuffer, random_crop
 
 
 def make_agent():
-    with contextlib.redirect_stdout(io.StringIO()):
-        return SPRSacAgent(
-            obs_shape=(9, 84, 84), action_shape=(2,), device="cpu",
-            augmentation=("crop", "intensity"),
-            transition_model_type="deterministic",
-            transition_model_layer_width=16, encoder_feature_dim=8,
-            latent_dim=16, hidden_dim=16, num_layers=2, num_filters=4,
-            jumps=2, log_interval=1, actor_update_freq=1,
-            critic_target_update_freq=1,
-        )
+    return SPRSacAgent(
+        obs_shape=(9, 84, 84), action_shape=(2,), device="cpu",
+        transition_model_layer_width=16, encoder_feature_dim=8,
+        latent_dim=16, hidden_dim=16, num_layers=2, num_filters=4,
+        jumps=2, log_interval=1, actor_update_freq=1,
+        critic_target_update_freq=1,
+    )
 
 
 def make_buffer(obs_shape=(9, 100, 100)):
@@ -105,11 +100,9 @@ class CropTests(unittest.TestCase):
         self.assertTrue(crops.flags.c_contiguous)
         self.assertTrue(crops.flags.writeable)
 
-    def test_equal_size_and_temporal_crop(self):
+    def test_equal_size_crop(self):
         images = np.arange(2 * 3 * 4 * 4).reshape(2, 3, 4, 4)
         np.testing.assert_array_equal(random_crop(images, 4), images)
-        temporal_images = np.stack([images, images + 1000])
-        np.testing.assert_array_equal(random_crop_2(temporal_images, 4), temporal_images)
 
     def test_bottom_and_right_edges_are_reachable(self):
         def largest_draw(low, high=None, size=None):
@@ -145,38 +138,36 @@ class ReplayTests(NumericalTestCase):
 
 
 class AugmentationTests(NumericalTestCase):
-    def make_spr(self, augmentations, probability):
-        critic = SimpleNamespace(encoder=nn.Identity())
-        with contextlib.redirect_stdout(io.StringIO()):
-            return SPR(
-                (2,), critic, critic, augmentations,
-                transition_model_type="deterministic", transition_model_layer_width=8,
-                encoder_feature_dim=4, latent_dim=8, jumps=2, aug_prob=probability,
-            )
-
-    def test_all_augmentations_with_full_partial_and_zero_probability(self):
-        images = torch.randint(0, 256, (2, 2, 9, 100, 100), dtype=torch.uint8)
-        for augmentation in ("crop", "affine", "rrc", "blur", "shift", "intensity", "none"):
-            pipeline = (augmentation,) if augmentation in {"crop", "rrc", "shift"} else ("crop", augmentation)
-            for probability in (0.0, 0.5, 1.0):
-                with self.subTest(augmentation=augmentation, probability=probability):
-                    spr = self.make_spr(pipeline, probability)
-                    transformed = spr.transform(images, augment=True)
-                    evaluation = spr.transform(images, augment=False)
-                    self.assertEqual(transformed.shape, (2, 2, 9, 84, 84))
-                    self.assertEqual(evaluation.shape, transformed.shape)
-                    self.assertTrue(torch.isfinite(transformed).all())
-                    self.assertEqual(transformed.dtype, torch.float32)
-                    if probability == 0.0:
-                        torch.testing.assert_close(transformed, evaluation)
+    def test_crop_and_intensity_preserve_pixel_geometry(self):
+        spr = make_agent().SPR
+        images = torch.zeros((2, 2, 9, 100, 100), dtype=torch.uint8)
+        images[:, :, 0] = 100
+        images[:, :, 1] = torch.arange(100).reshape(100, 1)
+        images[:, :, 2] = torch.arange(100).reshape(1, 100)
+        transformed = spr.augment(images)
+        self.assertEqual(transformed.shape, (2, 2, 9, 84, 84))
+        self.assertEqual(transformed.dtype, torch.float32)
+        self.assertTrue(torch.isfinite(transformed).all())
+        flat = transformed.flatten(0, 1)
+        gains = flat[:, 0, 0, 0] / 100
+        self.assertTrue(torch.all((gains >= 0.9) & (gains <= 1.1)))
+        restored = flat / gains[:, None, None, None]
+        torch.testing.assert_close(restored[:, 0], torch.full_like(restored[:, 0], 100))
+        for channel, axis in ((1, -2), (2, -1)):
+            origin = restored[:, channel, 0, 0]
+            self.assertTrue(torch.all((origin >= -1e-5) & (origin <= 16 + 1e-5)))
+            torch.testing.assert_close(origin, origin.round())
+            torch.testing.assert_close(
+                restored[:, channel].diff(dim=axis),
+                torch.ones_like(restored[:, channel].diff(dim=axis)))
 
     def test_uint8_and_float_inputs_keep_the_same_pixel_scale(self):
-        spr = self.make_spr(("crop", "intensity"), 1.0)
+        spr = make_agent().SPR
         images = torch.full((2, 9, 100, 100), 128, dtype=torch.uint8)
         torch.manual_seed(19)
-        uint8_output = spr.transform(images, augment=True)
+        uint8_output = spr.augment(images)
         torch.manual_seed(19)
-        float_output = spr.transform(images.float(), augment=True)
+        float_output = spr.augment(images.float())
         torch.testing.assert_close(uint8_output, float_output)
         self.assertGreater(float(uint8_output.mean()), 100.0)
         self.assertLess(float(uint8_output.mean()), 150.0)
@@ -191,7 +182,6 @@ class AgentTests(NumericalTestCase):
             next_observation = np.random.randint(0, 256, observation.shape, dtype=np.uint8)
             buffer.add(observation, np.random.uniform(-1, 1, 2).astype(np.float32),
                        1.0, next_observation, False)
-        buffer.add_agent(agent)
         tracked = {
             "actor": agent.actor.trunk[0].weight,
             "critic": agent.critic.Q1.trunk[0].weight,

@@ -1,8 +1,10 @@
 # SPR-SAC: setup and six Control Suite experiments
 
 This guide describes the current `spr_sac` implementation and the experiment
-presets in [`src/configs`](src/configs). Training writes scalar metrics to the
-console and local JSON logs.
+presets in [`src/configs`](src/configs). It uses pixel observations, a deterministic
+latent transition model, and random crop followed by intensity jitter for SPR.
+Numeric hyperparameters remain configurable. Training writes scalar metrics to
+the console and local JSON logs.
 
 ## 1. Create a conda environment
 
@@ -126,7 +128,7 @@ otherwise.
 | `reacher_easy` | `reacher/easy` | 4 |
 | `walker_walk` | `walker/walk` | 2 |
 
-Each preset already selects `agent: spr_sac`. All six use a training horizon of
+All six SPR-SAC presets use a training horizon of
 `105000`, a warmup of `1000` agent decisions, and evaluation every `5000`
 training steps for `10` episodes. Cheetah uses `2e-4` for the actor, critic,
 encoder, and auxiliary learning rates; the other presets use `1e-3`.
@@ -169,8 +171,8 @@ python src/train.py --config-path configs --config-name cartpole_swingup \
 ```
 
 Use any config name from the table with the same command structure. Supply
-`seed` explicitly for reproducible runs; the preset fallback chooses a random
-seed. `gpuid` is the CUDA index visible to PyTorch. EGL rendering-device
+`seed` explicitly for reproducible runs. The preset value `seed=-1` chooses a
+random seed. `gpuid` is the CUDA index visible to PyTorch. EGL rendering-device
 selection can be controlled separately with `MUJOCO_EGL_DEVICE_ID` when needed.
 
 To inspect a configuration without starting an experiment:

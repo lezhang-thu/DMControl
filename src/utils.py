@@ -3,67 +3,13 @@
 # Licensed under The MIT License
 # --------------------------------------------------------
 
-import os
 import random
 from collections import deque
 
 import gymnasium as gym
 import numpy as np
 import torch
-import torch.nn as nn
 from numpy.lib.stride_tricks import sliding_window_view
-from torch.utils.data import Dataset
-
-
-def to_categorical(value, limit=300):
-    value = value.float()  # Avoid any fp16 shenanigans
-    value = value.clamp(-limit, limit)
-    distribution = torch.zeros(value.shape[0], (limit * 2 + 1),
-                               device=value.device)
-    lower = value.floor().long() + limit
-    upper = value.ceil().long() + limit
-    upper_weight = value % 1
-    lower_weight = 1 - upper_weight
-    distribution.scatter_add_(-1, lower.unsqueeze(-1),
-                              lower_weight.unsqueeze(-1))
-    distribution.scatter_add_(-1, upper.unsqueeze(-1),
-                              upper_weight.unsqueeze(-1))
-    return distribution
-
-
-def maybe_transform(image, transform, alt_transform, p=0.8):
-    processed_images = transform(image)
-    if p >= 1:
-        return processed_images
-    else:
-        base_images = alt_transform(image)
-        mask = torch.rand((processed_images.shape[0], 1, 1, 1),
-                          device=processed_images.device)
-        mask = (mask < p).float()
-        processed_images = mask * processed_images + (1 - mask) * base_images
-        return processed_images
-
-
-def infer_leading_dims(tensor, dim):
-    """Looks for up to two leading dimensions in ``tensor``, before
-    the data dimensions, of which there are assumed to be ``dim`` number.
-    For use at beginning of model's ``forward()`` method, which should 
-    finish with ``restore_leading_dims()`` (see that function for help.)
-    Returns:
-    lead_dim: int --number of leading dims found.
-    T: int --size of first leading dim, if two leading dims, o/w 1.
-    B: int --size of first leading dim if one, second leading dim if two, o/w 1.
-    shape: tensor shape after leading dims.
-    """
-    lead_dim = tensor.dim() - dim
-    assert lead_dim in (0, 1, 2)
-    if lead_dim == 2:
-        T, B = tensor.shape[:2]
-    else:
-        T = 1
-        B = 1 if lead_dim == 0 else tensor.shape[0]
-    shape = tensor.shape[lead_dim:]
-    return lead_dim, T, B, shape
 
 
 class eval_mode(object):
@@ -96,34 +42,7 @@ def set_seed_everywhere(seed):
     random.seed(seed)
 
 
-def module_hash(module):
-    result = 0
-    for tensor in module.state_dict().values():
-        result += tensor.sum().item()
-    return result
-
-
-def make_dir(dir_path):
-    try:
-        os.makedirs(dir_path)
-    except OSError:
-        pass
-    return dir_path
-
-
-def preprocess_obs(obs, bits=5):
-    """Preprocessing image, see https://arxiv.org/abs/1807.03039."""
-    bins = 2**bits
-    assert obs.dtype == torch.float32
-    if bits < 8:
-        obs = torch.floor(obs / 2**(8 - bits))
-    obs = obs / bins
-    obs = obs + torch.rand_like(obs) / bins
-    obs = obs - 0.5
-    return obs
-
-
-class ReplayBuffer(Dataset):
+class ReplayBuffer:
     """Buffer to store environment transitions."""
     def __init__(self,
                  obs_shape,
@@ -132,21 +51,16 @@ class ReplayBuffer(Dataset):
                  batch_size,
                  device,
                  image_size=84,
-                 transform=None,
                  auxiliary_task_batch_size=64,
                  jumps=5):
         self.capacity = capacity
         self.batch_size = batch_size
         self.device = device
         self.image_size = image_size
-        self.transform = transform
         self.auxiliary_task_batch_size = auxiliary_task_batch_size
         self.jumps = jumps
-        # the proprioceptive obs is stored as float32, pixels obs as uint8
-        obs_dtype = np.float32 if len(obs_shape) == 1 else np.uint8
-
-        self.obses = np.empty((capacity, *obs_shape), dtype=obs_dtype)
-        self.next_obses = np.empty((capacity, *obs_shape), dtype=obs_dtype)
+        self.obses = np.empty((capacity, *obs_shape), dtype=np.uint8)
+        self.next_obses = np.empty_like(self.obses)
         self.actions = np.empty((capacity, *action_shape), dtype=np.float32)
         self.rewards = np.empty((capacity, 1), dtype=np.float32)
         self.not_dones = np.empty((capacity, 1), dtype=np.float32)  # for infinite bootstrap
@@ -154,8 +68,6 @@ class ReplayBuffer(Dataset):
 
         self.idx = 0
         self.full = False
-
-        self.current_auxiliary_batch_size = batch_size
 
     def add(self, obs, action, reward, next_obs, terminated, truncated=False):
 
@@ -170,44 +82,11 @@ class ReplayBuffer(Dataset):
         self.idx = (self.idx + 1) % self.capacity
         self.full = self.full or self.idx == 0
 
-    def sample_proprio(self):
-
-        idxs = np.random.randint(0,
-                                 self.capacity if self.full else self.idx,
-                                 size=self.batch_size)
-
-        obses = self.obses[idxs]
-        next_obses = self.next_obses[idxs]
-
-        obses = torch.as_tensor(obses, device=self.device).float()
-        actions = torch.as_tensor(self.actions[idxs], device=self.device)
-        rewards = torch.as_tensor(self.rewards[idxs], device=self.device)
-        next_obses = torch.as_tensor(next_obses, device=self.device).float()
-        not_dones = torch.as_tensor(self.not_dones[idxs], device=self.device)
-        return obses, actions, rewards, next_obses, not_dones
-
-    def sample(self):
-        idxs = np.random.randint(0,
-                                 self.capacity if self.full else self.idx,
-                                 size=self.batch_size)
-
-        obses = torch.as_tensor(self.obses[idxs], device=self.device).float()
-        actions = torch.as_tensor(self.actions[idxs], device=self.device)
-        curr_rewards = torch.as_tensor(self.curr_rewards[idxs],
-                                       device=self.device)
-        rewards = torch.as_tensor(self.rewards[idxs], device=self.device)
-        next_obses = torch.as_tensor(self.next_obses[idxs],
-                                     device=self.device).float()
-
-        return obses, actions, curr_rewards, rewards, next_obses, not_dones
-
-    # v2
     def sample_spr(self):   # sample batch for auxiliary task
         idxs = np.random.randint(0,
                                  self.capacity - self.jumps -
                                  1 if self.full else self.idx - self.jumps - 1,
                                  size=self.auxiliary_task_batch_size*2)
-                                #  size=self.auxiliary_task_batch_size)
         idxs = idxs.reshape(-1, 1)
         step = np.arange(self.jumps + 1).reshape(1, -1) # this is a range
         idxs = idxs + step
@@ -216,98 +95,31 @@ class ReplayBuffer(Dataset):
         # we add this to avoid sampling the episode boundaries
         valid_idxs = torch.where((real_dones.mean(1)==0).squeeze(-1))[0].cpu().numpy()
         idxs = idxs[valid_idxs] # (B, jumps+1)
-        idxs = idxs[:self.auxiliary_task_batch_size] if idxs.shape[0] >= self.auxiliary_task_batch_size else idxs
-        self.current_auxiliary_batch_size = idxs.shape[0]
+        idxs = idxs[:self.auxiliary_task_batch_size]
 
         obses = torch.as_tensor(self.obses[idxs], device=self.device).float()   # (B, jumps+1, 3*3=9, 100, 100)
-        next_obses = torch.as_tensor(self.next_obses[idxs], device=self.device).float()
         actions = torch.as_tensor(self.actions[idxs], device=self.device)
-        rewards = torch.as_tensor(self.rewards[idxs], device=self.device)
-        not_dones = torch.as_tensor(self.not_dones[idxs], device=self.device)   # (B, jumps+1, 1)
-    
+
         spr_samples = {
             'observation': obses.transpose(0, 1).unsqueeze(3),
             'action': actions.transpose(0, 1),
-            'reward': rewards.transpose(0, 1),
         }
-        return (*self.sample_aug(original_augment=True), spr_samples)
+        return (*self.sample_aug(), spr_samples)
 
-    
-    # # v1
-    # def sample_spr(self):
-    #     idxs = np.random.randint(0,
-    #                              self.capacity - self.jumps -
-    #                              1 if self.full else self.idx - self.jumps - 1,
-    #                              size=self.auxiliary_task_batch_size)
-    #     idxs = idxs.reshape(-1, 1)
-    #     step = np.arange(self.jumps + 1).reshape(1, -1)
-    #     idxs = idxs + step
-    #     obses = torch.as_tensor(self.obses[idxs], device=self.device).float()
-    #     next_obses = torch.as_tensor(self.next_obses[idxs],
-    #                                  device=self.device).float()
-    #     actions = torch.as_tensor(self.actions[idxs], device=self.device)
-    #     rewards = torch.as_tensor(self.rewards[idxs], device=self.device)
-    #     not_dones = torch.as_tensor(self.not_dones[idxs], device=self.device)
-
-    #     spr_samples = {
-    #         'observation': obses.transpose(0, 1).unsqueeze(3),
-    #         'action': actions.transpose(0, 1),
-    #         'reward': rewards.transpose(0, 1),
-    #     }
-    #     # print(obses.transpose(0, 1).unsqueeze(3).size())
-    #     return (*self.sample_aug(original_augment=True), spr_samples)
-    
-
-    def sample_aug(self, original_augment=False):
+    def sample_aug(self):
         idxs = np.random.randint(0,
                                  self.capacity if self.full else self.idx,
                                  size=self.batch_size)
 
-        obses = self.obses[idxs]
-        next_obses = self.next_obses[idxs]
-
-        if not original_augment:
-            obses = torch.as_tensor(obses, device=self.device).float()
-            next_obses = torch.as_tensor(next_obses,
-                                         device=self.device).float()
-            if hasattr(self, 'SPR'):
-                obses = self.SPR.transform(obses, augment=True)
-                next_obses = self.SPR.transform(next_obses, augment=True)
-        else:
-            obses = random_crop(obses, self.image_size)
-            next_obses = random_crop(next_obses, self.image_size)
-            obses = torch.as_tensor(obses, device=self.device).float()
-            next_obses = torch.as_tensor(next_obses,
-                                         device=self.device).float()
+        obses = random_crop(self.obses[idxs], self.image_size)
+        next_obses = random_crop(self.next_obses[idxs], self.image_size)
+        obses = torch.as_tensor(obses, device=self.device).float()
+        next_obses = torch.as_tensor(next_obses, device=self.device).float()
 
         actions = torch.as_tensor(self.actions[idxs], device=self.device)
         rewards = torch.as_tensor(self.rewards[idxs], device=self.device)
         not_dones = torch.as_tensor(self.not_dones[idxs], device=self.device)
         return obses, actions, rewards, next_obses, not_dones
-
-    def add_agent(self, agent):
-        if hasattr(agent, 'SPR'):
-            self.SPR = agent.SPR
-
-    def __getitem__(self, idx):
-        idx = np.random.randint(0,
-                                self.capacity if self.full else self.idx,
-                                size=1)
-        idx = idx[0]
-        obs = self.obses[idx]
-        action = self.actions[idx]
-        reward = self.rewards[idx]
-        next_obs = self.next_obses[idx]
-        not_done = self.not_dones[idx]
-
-        if self.transform:
-            obs = self.transform(obs)
-            next_obs = self.transform(next_obs)
-
-        return obs, action, reward, next_obs, not_done
-
-    def __len__(self):
-        return self.capacity
 
 
 class FrameStack(gym.Wrapper):
@@ -350,12 +162,6 @@ def random_crop(imgs, output_size):
     return windows[np.arange(n), :, rows, cols].copy()
 
 
-def random_crop_2(imgs, output_size):
-    n1, n2 = imgs.shape[:2]
-    cropped = random_crop(imgs.reshape(n1 * n2, *imgs.shape[2:]), output_size)
-    return cropped.reshape(n1, n2, *cropped.shape[1:])
-
-
 def center_crop_image(image, output_size):
     h, w = image.shape[1:]
     new_h, new_w = output_size, output_size
@@ -365,68 +171,3 @@ def center_crop_image(image, output_size):
 
     image = image[:, top:top + new_h, left:left + new_w]
     return image
-
-
-def conv2d_output_shape(h, w, kernel_size=1, stride=1, padding=0, dilation=1):
-    """
-    Returns output H, W after convolution/pooling on input H, W.
-    """
-    kh, kw = kernel_size if isinstance(kernel_size,
-                                       tuple) else (kernel_size, ) * 2
-    sh, sw = stride if isinstance(stride, tuple) else (stride, ) * 2
-    ph, pw = padding if isinstance(padding, tuple) else (padding, ) * 2
-    d = dilation
-    h = (h + (2 * ph) - (d * (kh - 1)) - 1) // sh + 1
-    w = (w + (2 * pw) - (d * (kw - 1)) - 1) // sw + 1
-    return h, w
-
-
-class ScaleGrad(torch.autograd.Function):
-    """Model component to scale gradients back from layer, without affecting
-    the forward pass.  Used e.g. in dueling heads DQN models."""
-    @staticmethod
-    def forward(ctx, tensor, scale):
-        """Stores the ``scale`` input to ``ctx`` for application in
-        ``backward()``; simply returns the input ``tensor``."""
-        ctx.scale = scale
-        return tensor
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Return the ``grad_output`` multiplied by ``ctx.scale``.  Also returns
-        a ``None`` as placeholder corresponding to (non-existent) gradient of 
-        the input ``scale`` of ``forward()``."""
-        return grad_output * ctx.scale, None
-
-
-# scale_grad = ScaleGrad.apply
-# Supply a dummy for documentation to render.
-scale_grad = getattr(ScaleGrad, "apply", None)
-
-
-def update_state_dict(model, state_dict, tau=1, strip_ddp=True):
-    """Update the state dict of ``model`` using the input ``state_dict``, which
-    must match format.  ``tau==1`` applies hard update, copying the values, ``0<tau<1``
-    applies soft update: ``tau * new + (1 - tau) * old``.
-    """
-    if strip_ddp:
-        state_dict = strip_ddp_state_dict(state_dict)
-    if tau == 1:
-        model.load_state_dict(state_dict)
-    elif tau > 0:
-        update_sd = {
-            k: tau * state_dict[k] + (1 - tau) * v
-            for k, v in model.state_dict().items()
-        }
-        model.load_state_dict(update_sd)
-
-
-def strip_ddp_state_dict(state_dict):
-    """ Workaround the fact that DistributedDataParallel prepends 'module.' to
-    every key, but the sampler models will not be wrapped in
-    DistributedDataParallel. (Solution from PyTorch forums.)"""
-    clean_state_dict = type(state_dict)()
-    for k, v in state_dict.items():
-        key = k[7:] if k[:7] == "module." else k
-        clean_state_dict[key] = v
-    return clean_state_dict

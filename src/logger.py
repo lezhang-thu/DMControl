@@ -11,15 +11,13 @@ import torch
 from termcolor import colored
 
 FORMAT_CONFIG = {
-    'rl': {
-        'train': [('episode', 'E', 'int'), ('step', 'S', 'int'),
-                  ('duration', 'D', 'time'), ('episode_reward', 'R', 'float'),
-                  ('batch_reward', 'BR', 'float'),
-                  ('actor_loss', 'A_LOSS', 'float'),
-                  ('critic_loss', 'C_LOSS', 'float'),
-                  ('spr_loss', 'SPR_LOSS', 'float')],
-        'eval': [('step', 'S', 'int'), ('episode_reward', 'ER', 'float')]
-    }
+    'train': [('episode', 'E', 'int'), ('step', 'S', 'int'),
+              ('duration', 'D', 'time'), ('episode_reward', 'R', 'float'),
+              ('batch_reward', 'BR', 'float'),
+              ('actor_loss', 'A_LOSS', 'float'),
+              ('critic_loss', 'C_LOSS', 'float'),
+              ('spr_loss', 'SPR_LOSS', 'float')],
+    'eval': [('step', 'S', 'int'), ('episode_reward', 'ER', 'float')]
 }
 
 
@@ -94,11 +92,11 @@ class MetersGroup(object):
 
 class Logger(object):
     """Write scalar metrics to JSON logs and the console."""
-    def __init__(self, log_dir, config='rl'):
+    def __init__(self, log_dir):
         self._train_mg = MetersGroup(os.path.join(log_dir, 'train_info.log'),
-                                     formating=FORMAT_CONFIG[config]['train'])
+                                     formating=FORMAT_CONFIG['train'])
         self._eval_mg = MetersGroup(os.path.join(log_dir, 'eval_info.log'),
-                                    formating=FORMAT_CONFIG[config]['eval'])
+                                    formating=FORMAT_CONFIG['eval'])
 
     def log(self, key, value, step, n=1):
         assert key.startswith('train') or key.startswith('eval')

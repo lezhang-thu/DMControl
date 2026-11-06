@@ -24,8 +24,7 @@ class PixelEncoder(nn.Module):
                  obs_shape,
                  feature_dim,
                  num_layers=2,
-                 num_filters=32,
-                 output_logits=False):
+                 num_filters=32):
         super().__init__()
 
         assert len(obs_shape) == 3
@@ -42,13 +41,6 @@ class PixelEncoder(nn.Module):
             num_layers]
         self.fc = nn.Linear(num_filters * out_dim * out_dim, self.feature_dim)
         self.ln = nn.LayerNorm(self.feature_dim)
-
-        self.output_logits = output_logits
-
-    def reparameterize(self, mu, logstd):
-        std = torch.exp(logstd)
-        eps = torch.randn_like(std)
-        return mu + eps * std
 
     def forward_conv(self, obs):
         obs = obs / 255.
@@ -67,51 +59,10 @@ class PixelEncoder(nn.Module):
         if detach:
             h = h.detach()
 
-        h_fc = self.fc(h)
-
-        h_norm = self.ln(h_fc)
-
-        if self.output_logits:
-            out = h_norm
-        else:
-            out = torch.tanh(h_norm)
-
-        return out
+        return self.ln(self.fc(h))
 
     def copy_conv_weights_from(self, source):
         """Tie convolutional layers"""
         # only tie conv layers
         for i in range(self.num_layers):
             tie_weights(src=source.convs[i], trg=self.convs[i])
-
-
-class IdentityEncoder(nn.Module):
-    def __init__(self, obs_shape, feature_dim, num_layers, num_filters, *args):
-        super().__init__()
-
-        assert len(obs_shape) == 1
-        self.feature_dim = obs_shape[0]
-
-    def forward(self, obs, detach=False):
-        return obs
-
-    def copy_conv_weights_from(self, source):
-        pass
-
-
-_AVAILABLE_ENCODERS = {
-    'pixel': PixelEncoder,
-    'identity': IdentityEncoder
-}
-
-
-def make_encoder(encoder_type,
-                 obs_shape,
-                 feature_dim,
-                 num_layers,
-                 num_filters,
-                 output_logits=False):
-    assert encoder_type in _AVAILABLE_ENCODERS
-    return _AVAILABLE_ENCODERS[encoder_type](obs_shape, feature_dim,
-                                             num_layers, num_filters,
-                                             output_logits)
